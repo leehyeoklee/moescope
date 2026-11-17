@@ -35,9 +35,16 @@ obtained by computing traffic from routing transfer to a real multi-GPU deployme
 ## Install
 
 ```bash
-pip install -e .            # core: numpy, scikit-learn, torch (CPU is enough for verify-ep / train / tests)
-pip install -e ".[model]"   # + transformers etc. for `collect` / `demo` (GPU recommended)
+git clone https://github.com/<you>/moe-traffic-leak.git
+cd moe-traffic-leak
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
+pip install -e .                   # core: numpy, scikit-learn, torch (CPU is enough for verify-ep / train / tests)
+pip install -e ".[model]"          # + transformers etc. for `collect` / `demo` (GPU recommended)
 ```
+
+On Windows, `torchrun` has a libuv issue, so use the equivalent self-launching command instead:
+`moetl measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4` (Linux can use either).
 
 ## Quickstart
 
