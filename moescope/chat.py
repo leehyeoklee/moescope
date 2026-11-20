@@ -60,7 +60,7 @@ def _wrap(lines, pieces, first="  "):
 def render(prompt, gen_tokens, recon, domain, trow, gpus, info=None):
     """화면 한 장을 그린다.
 
-    recon: [(복원 토큰, 맞았는지)] 또는 None(응답 토큰 분류기 없음).  domain: (분야, 확률) 또는 None.
+    recon: [(복원 토큰, 맞았는지)] 또는 None(응답 토큰 분류기 없음).  domain: [(분야, 확률), ...] 확률이 높은 순서, 또는 None.
     trow: 이 토큰을 처리하며 GPU별로 보낸 행 수.  info: EP 서빙 상태(title, per, calls, mismatch, layers, clf).
     """
     info = info or {}
@@ -74,7 +74,11 @@ def render(prompt, gen_tokens, recon, domain, trow, gpus, info=None):
     Rr.append(f"{BOLD}{YEL} ep-traffic-mon{R}{DIM}  measured · {gpus} GPUs{R}")
     Rr.append(f"{GREY}{'─'*PANEL}{R}")
     if domain:
-        Rr.append(f"{DIM}domain≈{R} {YEL}{BOLD}{domain[0]}{R} {DIM}p={domain[1]:.2f}{R}")
+        if not isinstance(domain[0], (tuple, list)):
+            domain = [domain]
+        Rr.append(f"{DIM}domain≈{R} {YEL}{BOLD}{domain[0][0]}{R} {DIM}{domain[0][1]:.2f}{R}")
+        for name, prob in domain[1:]:
+            Rr.append(f"        {name} {DIM}{prob:.2f}{R}")
     else:
         Rr.append(f"{DIM}domain≈{R} {GREY}{'inferring…' if info.get('clf', (1, 1))[1] else 'no classifier'}{R}")
     Rr.append("")
@@ -156,7 +160,8 @@ class Live:
         if prefill is not None and self.dom is not None:
             x = measured_prompt_features(prefill[0][None], [prefill[1]])
             p = self.dom["model"].predict_proba(x)[0]
-            self.domain = (str(self.dom["model"].classes_[p.argmax()]), float(p.max()))
+            top = np.argsort(p)[::-1][:3]                      # 확률이 높은 분야 3개
+            self.domain = [(str(self.dom["model"].classes_[i]), float(p[i])) for i in top]
         if self.out is not None:
             self.feats.append(measured_features(sends[None])[0])
             causal = self.out.get("meta", {}).get("window") == "causal"
@@ -173,7 +178,8 @@ class Live:
         if self.recon:
             row["recovered"] = sum(ok for _, ok in self.recon)
         if self.domain:
-            row["domain"] = self.domain[0]
+            row["domain"] = self.domain[0][0]
+            row["domain_top3"] = [(n, round(pr, 3)) for n, pr in self.domain]
         self.summary.append(row)
         if self.delay:
             time.sleep(self.delay * 6)

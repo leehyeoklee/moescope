@@ -29,6 +29,8 @@ def test_pretrained_classifiers_fit_the_traffic_shape(model, gpus, capsys):
     screen = capsys.readouterr().out
     assert "recovered stream" in screen and "GPU%d" % (gpus - 1) in screen
     assert live.summary[0]["tokens"] == 2 and "domain" in live.summary[0]
+    top3 = live.summary[0]["domain_top3"]
+    assert len(top3) == 3 and top3[0][1] >= top3[1][1] >= top3[2][1] and top3[1][0] in screen
 
 
 def test_no_pretrained_for_other_gpu_counts():
