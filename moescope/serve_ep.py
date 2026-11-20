@@ -226,10 +226,11 @@ def _forward(model, ids, past, rec):
 
 @torch.no_grad()
 def run_decode(model, rec, inputs, max_new_tokens, eos=None, watch=None, spans=None):
-    """응답 생성(decode): 토큰을 하나씩 만들며 단계별 측정 통신량·라우팅을 모은다.
+    """응답 생성(decode): 토큰을 하나씩 만들며 토큰별 측정 통신량·라우팅을 모은다.
 
-    프롬프트의 마지막 토큰은 따로 한 번에 넣는다. 그래야 첫 생성 단계의 통신량도 토큰 하나 몫으로
-    측정된다(KV cache를 쓰므로 결과는 프롬프트를 한 번에 넣은 것과 같다).
+    생성한 토큰 하나의 통신량은 그 토큰을 모델에 넣어 처리할 때 측정한 값이다. 즉 tokens[i]와
+    measured[i]·routing[i]는 같은 토큰의 것이다. 마지막으로 생성한 토큰도 한 번 넣어 통신량을 잰다.
+    프롬프트를 읽는 동안(마지막 토큰까지)의 통신량은 prefill_measured에 모은다.
     watch(chat.Live)가 있으면 토큰을 하나 만들 때마다 그 단계의 측정 통신량을 넘겨 화면을 갱신한다.
     spans가 있으면 입력 가운데 문장 자체의 구간(대화 형식의 앞뒤 토큰 제외)을 따로 넣어 그 구간의
     통신량을 잰다. 입력 분야 분류기는 문장만 넣어 잰 통신량으로 학습하기 때문이다.
@@ -255,17 +256,15 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None, watch=None, spans=N
         elif n > 1:
             out, s, _ = _forward(model, ids[:, :-1], None, rec)
             past, pv = out.past_key_values, pv + s
-        cur = ids[:, -1:]
+        out, s, _ = _forward(model, ids[:, -1:], past, rec)       # 프롬프트의 마지막 토큰: 여기까지가 prefill
+        past, pv = out.past_key_values, pv + s
         for step in range(max_new_tokens):
-            out, s, r = _forward(model, cur, past, rec)
+            nxt = int(out.logits[0, -1].argmax())                  # 생성한 토큰
+            out, s, r = _forward(model, torch.tensor([[nxt]], device=device), past, rec)   # 그 토큰을 처리
             past = out.past_key_values
-            nxt = int(out.logits[0, -1].argmax())
             toks.append(nxt); routes.append(r[0]); vols.append(s); pids.append(pid); steps.append(step)
-            if step == 0:
-                pv = pv + s
             if watch is not None:
                 watch.step(nxt, s, (text or (pv, n)) if step == 0 else None, rec)
-            cur = torch.tensor([[nxt]], device=device)
             if eos is not None and nxt == eos:
                 break
         pre_vol.append(pv)

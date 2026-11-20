@@ -15,7 +15,8 @@ runs this for real, records the per-layer, per-GPU row counts, and trains classi
 - **EP serving.** One process per GPU. Experts are split in index order (`E/G` per GPU). The
   model produces the same output as when it runs on a single GPU.
 - **Traffic measurement.** For every MoE layer, the number of rows actually sent to each GPU is
-  recorded: per prompt in the prefill stage, per generated token in the decode stage.
+  recorded: per prompt in the prefill stage, per generated token in the decode stage. The traffic
+  of a generated token is the traffic measured while that token is fed back into the model.
 - **Feature extraction and classifiers.** The measured traffic is turned into classifier inputs
   (prefill traffic divided by the number of input tokens; decode traffic per generated token). An
   input-topic classifier and an output-token classifier (standardization followed by logistic
@@ -200,8 +201,8 @@ initialized models with the OLMoE, Granite and Qwen1.5-MoE layouts, using 1, 2 a
 | task | key | shape | content |
 |---|---|---|---|
 | `decode` | `tokens` | (N,) | generated token ids |
-| | `routing` | (N, layers, k) | top-k expert ids per step |
-| | `measured` | (N, layers, G) | rows sent to each GPU per step |
+| | `routing` | (N, layers, k) | top-k expert ids of each generated token |
+| | `measured` | (N, layers, G) | rows sent to each GPU while each generated token is processed |
 | | `prefill_measured` | (P, layers, G) | rows sent to each GPU while reading each prompt |
 | | `prompt_ids`, `step`, `generated` | | prompt index, step index, decoded text |
 | `prefill` | `prefill_routing` | (tokens, layers, k) | top-k expert ids per input token |
