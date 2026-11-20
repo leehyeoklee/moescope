@@ -62,6 +62,16 @@ moescope train --model olmoe --task domain --traces traces/olmoe_ep_prefill.npz 
 `serve-ep` prints a report and ends with `RESULT: PASS` when the measured traffic of every layer
 equals the count computed from the routing (`layer_calls_mismatch: 0`).
 
+While it runs, every process prints timestamped progress lines (`--quiet` turns them off):
+
+```
+[12:01:03 rank0] started on cuda:0 (NVIDIA L4), backend nccl, experts 0..15 of 64
+[12:01:03 rank0] loading the checkpoint on CPU
+[12:02:10 rank0] experts 0..15 on cuda:0, 5.1 GiB allocated
+[12:03:40 rank0] all 4 processes ready, serving in EP form
+[12:03:44 rank0] decode 1/30: 21 input tokens, 32 generated, 3.9s, traffic mismatches so far 0
+```
+
 With `--check`, the same inputs are first run with the unmodified model and the report adds:
 
 | field | stage | meaning |

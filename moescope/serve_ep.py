@@ -17,6 +17,7 @@ gate_up_proj / down_proj, forward(hidden, top_k_index, top_k_weights)) 하나만
   --check 를 주면 같은 입력을 한 GPU에서 실행한 결과와 비교한다(rank 0에 모델 전체가 올라갈 메모리 필요).
 """
 import os
+import time
 
 import numpy as np
 import torch
@@ -28,6 +29,19 @@ from .ep import ep_layer
 from .placement import dest_counts_full
 
 OP_STOP, OP_LAYER = 0, 1
+
+_LOG = {"on": False, "rank": 0}
+
+
+def log(msg):
+    """진행 상황을 시각·rank와 함께 바로 출력한다(--quiet이면 끈다)."""
+    if _LOG["on"]:
+        print(f"[{time.strftime('%H:%M:%S')} rank{_LOG['rank']}] {msg}", flush=True)
+
+
+def _every(i, n, parts=20):
+    """n개 가운데 i번째(1부터)를 출력할 차례인지. 길어도 20줄 안팎만 나오게 한다."""
+    return i == n or i == 1 or i % max(1, n // parts) == 0
 
 
 # ---------------------------------------------------------------- 모델 쪽 연결
@@ -180,7 +194,9 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None):
     """
     device = next(model.parameters()).device
     toks, routes, vols, pids, steps, pre_vol = [], [], [], [], [], []
+    t_all = time.time()
     for pid, ids in enumerate(inputs):
+        t0, n0 = time.time(), len(toks)
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         past, pv = None, np.zeros((rec.layers, rec.gpus), np.int64)
         if ids.shape[1] > 1:
@@ -198,6 +214,9 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None):
             if eos is not None and nxt == eos:
                 break
         pre_vol.append(pv)
+        log(f"decode {pid + 1}/{len(inputs)}: {ids.shape[1]} input tokens, {len(toks) - n0} generated, "
+            f"{time.time() - t0:.1f}s, traffic mismatches so far {rec.mismatch}")
+    log(f"decode done: {len(toks)} tokens in {time.time() - t_all:.0f}s")
     return {"tokens": np.array(toks, np.int64), "routing": np.stack(routes).astype(np.int32),
             "measured": np.stack(vols), "prompt_ids": np.array(pids, np.int64),
             "step": np.array(steps, np.int64), "prefill_measured": np.stack(pre_vol)}
@@ -208,10 +227,14 @@ def run_prefill(model, rec, inputs):
     """입력 처리(prefill): 프롬프트를 한 번에 넣고 프롬프트 단위 측정 통신량·라우팅을 모은다."""
     device = next(model.parameters()).device
     routes, lengths, vols = [], [], []
-    for ids in inputs:
+    t_all = time.time()
+    for i, ids in enumerate(inputs, 1):
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         _, s, r = _forward(model, ids, None, rec)
         routes.append(r); lengths.append(len(r)); vols.append(s)
+        if _every(i, len(inputs)):
+            log(f"prefill {i}/{len(inputs)}: {sum(lengths)} input tokens so far, {time.time() - t_all:.0f}s, "
+                f"traffic mismatches so far {rec.mismatch}")
     return {"prefill_routing": np.concatenate(routes).astype(np.int32), "prefill_lengths": np.array(lengths, np.int32),
             "prefill_measured": np.stack(vols), "prefill_ids": np.arange(len(inputs), dtype=np.int32)}
 
@@ -224,7 +247,7 @@ def run_forced(model, rec, inputs, ref):
     """
     device = next(model.parameters()).device
     same = total = 0; diffs = []
-    for ids, r in zip(inputs, ref):
+    for i, (ids, r) in enumerate(zip(inputs, ref), 1):
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         past = None
         if ids.shape[1] > 1:
@@ -236,6 +259,9 @@ def run_forced(model, rec, inputs, ref):
             same += int(int(lg.argmax()) == tok_id); total += 1
             diffs.append(float((lg - r["logits"][step]).abs().max()))
             cur = torch.tensor([[tok_id]], device=device)
+        if _every(i, len(inputs)):
+            log(f"step-by-step comparison {i}/{len(inputs)}: {same}/{total} steps equal, "
+                f"max logit diff {max(diffs):.4g}")
     return {"forced_token_agreement": same / max(total, 1), "forced_steps": total,
             "forced_max_logit_diff": max(diffs), "forced_mean_logit_diff": float(np.mean(diffs))}
 
@@ -245,7 +271,10 @@ def reference(model, inputs, task, max_new_tokens, eos=None):
     """한 장치에서 원래 모델 그대로 실행한 결과(비교용)."""
     device = model.get_input_embeddings().weight.device
     res = []
-    for ids in inputs:
+    t_all = time.time()
+    for i, ids in enumerate(inputs, 1):
+        if _every(i, len(inputs)):
+            log(f"unmodified model {i}/{len(inputs)}, {time.time() - t_all:.0f}s")
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         if task == "prefill":
             res.append(model(input_ids=ids, use_cache=False).logits[0, -1].float().cpu()); continue
@@ -272,6 +301,7 @@ def _reference_run(model, loader, backend, device, inputs, job, eos):
         import gc
         from transformers import AutoModelForCausalLM
         _, repo, revision, dtype = loader
+        log(f"loading the unmodified model across {torch.cuda.device_count()} GPUs for comparison")
         whole = AutoModelForCausalLM.from_pretrained(
             repo, revision=revision, torch_dtype=getattr(torch, dtype), device_map="auto",
             experts_implementation="eager").eval()   # EP와 같은 계산 방식(Expert마다 따로 계산)으로 비교
@@ -298,11 +328,17 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     per = experts // world
     assert per * world == experts, f"Expert {experts}개를 GPU {world}개로 똑같이 나눌 수 없다"
     lo, hi = rank * per, (rank + 1) * per
+    _LOG.update(on=bool(job.get("verbose")), rank=rank)
+    name = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+    log(f"started on {device} ({name}), backend {backend}, experts {lo}..{hi - 1} of {experts}")
 
     model = tok = ref = inputs = None
     for turn in range(world):                     # 한 번에 한 rank씩 올린다(CPU 메모리 최대치를 낮춘다)
         if turn == rank:
+            t0 = time.time()
+            log("loading the checkpoint on CPU")
             model, tok = load(loader)
+            log(f"checkpoint loaded in {time.time() - t0:.0f}s")
             mods = find_experts(model)
             assert len(mods) == layers, f"MoE layer 수 {len(mods)} != {layers}"
             hidden, dtype = mods[0].gate_up_proj.shape[-1], mods[0].gate_up_proj.dtype
@@ -311,6 +347,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
                 if inputs is None:
                     kw = {"truncation": True, "max_length": job.get("max_len", 32)} if job["task"] == "prefill" else {}
                     inputs = [tok(p, **kw)["input_ids"] for p in job["prompts"]]
+                log(f"task {job['task']}: {len(inputs)} prompts, {sum(len(x) for x in inputs)} input tokens")
                 if job.get("check"):
                     ref = _reference_run(model, loader, backend, device, inputs, job,
                                          getattr(tok, "eos_token_id", None))
@@ -323,25 +360,34 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
                 del model; model = None
             if backend == "nccl":
                 torch.cuda.empty_cache()
+                log(f"experts {lo}..{hi - 1} on {device}, {torch.cuda.memory_allocated(device) / 2**30:.1f} GiB allocated")
+            else:
+                log(f"experts {lo}..{hi - 1} ready")
         dist.barrier()
 
     if rank > 0:
+        log("waiting for layer calls from rank 0")
         worker_loop(mods, hidden, top_k, dtype, experts, world, rank, device)
+        log("done")
         dist.barrier(); dist.destroy_process_group()
         return
 
     rec = Recorder(layers, experts, world)
     attach(model, experts, world, rank, device, rec)
     eos = getattr(tok, "eos_token_id", None)
+    log(f"all {world} processes ready, serving in EP form")
     data = (run_prefill(model, rec, inputs) if job["task"] == "prefill"
             else run_decode(model, rec, inputs, job.get("max_new_tokens", 64), eos))
     report = {"gpus": world, "backend": backend, "layer_calls_mismatch": rec.mismatch}
     if ref is not None:
+        log("comparing with the unmodified model")
         if job["task"] == "prefill":                   # 마지막 위치의 logits를 다시 계산해 비교
             diffs = []
             for ids, r in zip(inputs, ref):
                 ids_t = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
-                out = model(input_ids=ids_t, use_cache=False); rec.reset()
+                with torch.no_grad():
+                    out = model(input_ids=ids_t, use_cache=False)
+                rec.reset()
                 diffs.append(float((out.logits[0, -1].float().cpu() - r).abs().max()))
             report["max_logit_diff"] = max(diffs)
         else:
@@ -380,10 +426,11 @@ def launch(loader, spec, job, gpus, backend=None, port=29541):
     return dict(ret["data"]), dict(ret["report"])
 
 
-def run(model_key, task, prompts, gpus, out, max_new_tokens=64, check=False, dtype="bfloat16", backend=None):
+def run(model_key, task, prompts, gpus, out, max_new_tokens=64, check=False, dtype="bfloat16", backend=None,
+        verbose=True):
     spec = config.get(model_key)
     loader = ("hf", spec.repo, spec.revision, dtype)
-    job = {"task": task, "prompts": prompts, "max_new_tokens": max_new_tokens, "check": check}
+    job = {"task": task, "prompts": prompts, "max_new_tokens": max_new_tokens, "check": check, "verbose": verbose}
     data, report = launch(loader, (spec.layers, spec.experts, spec.top_k), job, gpus, backend)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     np.savez_compressed(out, **data)

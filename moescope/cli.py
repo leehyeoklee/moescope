@@ -98,7 +98,7 @@ def cmd_serve_ep(a):
         prompts = prompts.get("prompts", list(prompts.values()))
     print(f"[serve-ep] {a.model} task={a.task} prompts={len(prompts)} gpus={a.gpus}")
     report = serve_ep.run(a.model, a.task, prompts, a.gpus, a.out, max_new_tokens=a.max_new_tokens,
-                          check=a.check, dtype=a.dtype, backend=a.backend)
+                          check=a.check, dtype=a.dtype, backend=a.backend, verbose=not a.quiet)
     print("  " + json.dumps(report, ensure_ascii=False))
     print(f"  saved {a.out}")
     ok = report["layer_calls_mismatch"] == 0
@@ -141,6 +141,7 @@ def main():
     s.add_argument("--gpus", type=int, default=4); s.add_argument("--max-new-tokens", type=int, default=64)
     s.add_argument("--check", action="store_true", help="한 GPU에서 실행한 결과와 비교")
     s.add_argument("--dtype", default="bfloat16"); s.add_argument("--backend", choices=["nccl", "gloo"])
+    s.add_argument("--quiet", action="store_true", help="진행 로그를 끈다")
     s.set_defaults(func=cmd_serve_ep)
 
     s = _add(sub, "measure-ep", "실제 EP 측정=계산 [멀티 GPU]")
