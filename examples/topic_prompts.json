@@ -1,0 +1,11 @@
+[
+  {"text": "What is the best way to bring down a mild fever at home?", "label": "Health"},
+  {"text": "How much water should an adult drink each day?", "label": "Health"},
+  {"text": "Which stretches help with lower back pain after sitting all day?", "label": "Health"},
+  {"text": "How many players are on the field for each team in a soccer match?", "label": "Sports"},
+  {"text": "What is the difference between a slider and a curveball in baseball?", "label": "Sports"},
+  {"text": "How should a beginner train for a first ten kilometer race?", "label": "Sports"},
+  {"text": "Why does my laptop get slow when many browser tabs are open?", "label": "Computers & Internet"},
+  {"text": "How do I back up my photos to an external hard drive?", "label": "Computers & Internet"},
+  {"text": "What is the difference between a router and a modem?", "label": "Computers & Internet"}
+]

@@ -27,5 +27,8 @@ moescope = "moescope.cli:main"
 [tool.setuptools.packages.find]
 include = ["moescope*"]
 
+[tool.setuptools.package-data]
+moescope = ["pretrained/*.joblib", "pretrained/index.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

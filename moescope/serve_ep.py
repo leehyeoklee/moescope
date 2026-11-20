@@ -12,9 +12,11 @@ gate_up_proj / down_proj, forward(hidden, top_k_index, top_k_weights)) 하나만
 그 밖의 계산은 원래 모델 코드를 그대로 쓴다.
 
 실행
-  moescope serve-ep --model olmoe --task decode --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_decode.npz
-  moescope serve-ep --model olmoe --task prefill --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_prefill.npz
-  --check 를 주면 같은 입력을 한 GPU에서 실행한 결과와 비교한다(rank 0에 모델 전체가 올라갈 메모리 필요).
+  moescope collect --model olmoe --task decode --prompts examples/prompts.json --gpus 4 --out traces/olmoe_decode.npz
+  moescope collect --model olmoe --task prefill --prompts examples/topic_prompts.json --gpus 4 --out traces/olmoe_prefill.npz
+      프롬프트 파일을 EP로 처리하며 통신량을 저장한다. --check 를 주면 같은 입력을 원래 모델로 실행한 결과와 비교한다.
+  moescope chat --model olmoe --gpus 4
+      모델을 EP로 올려 둔 채 입력창에서 문장을 받아 처리한다(chat.py).
 """
 import os
 import time
@@ -78,7 +80,7 @@ class Recorder:
 
     def __init__(self, layers, experts, gpus):
         self.layers, self.experts, self.gpus = layers, experts, gpus
-        self.mismatch = 0
+        self.mismatch = self.calls = 0
         self.reset()
 
     def reset(self):
@@ -89,7 +91,7 @@ class Recorder:
         sends = sends.detach().cpu().numpy().astype(np.int64)
         routing = routing.detach().cpu().numpy()
         computed = dest_counts_full(routing, self.experts, self.gpus).sum(0)
-        self.mismatch += int(not np.array_equal(sends, computed))
+        self.mismatch += int(not np.array_equal(sends, computed)); self.calls += 1
         self.sends[layer], self.routing[layer] = sends, routing
 
     def take(self):
@@ -133,11 +135,48 @@ def stop_workers(device):
 
 
 # ---------------------------------------------------------------- 모델 올리기
+def load_tokenizer(repo, revision):
+    """토크나이저를 불러온다. Granite처럼 기본 방식으로 열리지 않는 체크포인트는 GPT2TokenizerFast로 연다."""
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(repo, revision=revision)
+    except ValueError:
+        from transformers import GPT2TokenizerFast
+        return GPT2TokenizerFast.from_pretrained(repo, revision=revision)
+
+
+def encode(tok, text, task, raw=False, max_len=32):
+    """문장을 토큰 번호로 바꾼다. (ids, span)을 돌려주며 span은 ids 안에서 문장 자체가 놓인 구간이다.
+
+    prefill  문장만 넣는다. 앞에서 max_len개까지 쓴다.
+    decode   모델의 대화 형식(chat template)을 씌워 넣는다. 형식이 없는 토크나이저는 문장만 넣는다.
+    raw      토크나이저의 기본 동작 그대로 넣는다(대화 형식을 쓰지 않는다).
+    """
+    if tok is None:                       # 작은 임의 모델(동작 확인용): 글자를 토큰 번호로 쓴다
+        ids = [ord(c) % 97 for c in text][:24] or [1]
+        return ids, (0, len(ids))
+    if task == "prefill":
+        kw = {} if raw else {"add_special_tokens": False}
+        ids = list(tok(text, truncation=True, max_length=max_len, **kw)["input_ids"])
+        return ids, (0, len(ids))
+    if raw or not getattr(tok, "chat_template", None):
+        ids = list(tok(text)["input_ids"])
+        return ids, (0, len(ids))
+    ids = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, tokenize=True)
+    if hasattr(ids, "keys"):
+        ids = ids["input_ids"]
+    ids = list(ids[0]) if len(ids) and isinstance(ids[0], (list, tuple)) else list(ids)
+    body = list(tok(text, add_special_tokens=False)["input_ids"])
+    for a in range(len(ids) - len(body) + 1):
+        if body and ids[a:a + len(body)] == body:
+            return ids, (a, a + len(body))
+    return ids, (0, len(ids))
+
+
 def load(loader):
     """loader: ("hf", repo, revision, dtype) 또는 ("tiny", seed, layers, experts, top_k, hidden[, dtype[, family]])."""
     if loader[0] == "hf":
         from transformers import AutoModelForCausalLM
-        from .collect import load_tokenizer
         _, repo, revision, dtype = loader
         tok = load_tokenizer(repo, revision)
         model = AutoModelForCausalLM.from_pretrained(
@@ -186,11 +225,14 @@ def _forward(model, ids, past, rec):
 
 
 @torch.no_grad()
-def run_decode(model, rec, inputs, max_new_tokens, eos=None):
+def run_decode(model, rec, inputs, max_new_tokens, eos=None, watch=None, spans=None):
     """응답 생성(decode): 토큰을 하나씩 만들며 단계별 측정 통신량·라우팅을 모은다.
 
     프롬프트의 마지막 토큰은 따로 한 번에 넣는다. 그래야 첫 생성 단계의 통신량도 토큰 하나 몫으로
     측정된다(KV cache를 쓰므로 결과는 프롬프트를 한 번에 넣은 것과 같다).
+    watch(chat.Live)가 있으면 토큰을 하나 만들 때마다 그 단계의 측정 통신량을 넘겨 화면을 갱신한다.
+    spans가 있으면 입력 가운데 문장 자체의 구간(대화 형식의 앞뒤 토큰 제외)을 따로 넣어 그 구간의
+    통신량을 잰다. 입력 분야 분류기는 문장만 넣어 잰 통신량으로 학습하기 때문이다.
     """
     device = next(model.parameters()).device
     toks, routes, vols, pids, steps, pre_vol = [], [], [], [], [], []
@@ -199,7 +241,18 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None):
         t0, n0 = time.time(), len(toks)
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         past, pv = None, np.zeros((rec.layers, rec.gpus), np.int64)
-        if ids.shape[1] > 1:
+        n, text = ids.shape[1], None
+        a, b = spans[pid] if spans else (0, n)
+        if watch is not None:
+            watch.start(pid)
+        if 0 <= a < b <= n - 1 and (a, b) != (0, n - 1):      # 앞부분, 문장, 뒷부분을 차례로 넣는다
+            for lo, hi in ((0, a), (a, b), (b, n - 1)):
+                if hi > lo:
+                    out, s, _ = _forward(model, ids[:, lo:hi], past, rec)
+                    past, pv = out.past_key_values, pv + s
+                    if (lo, hi) == (a, b):
+                        text = (s, b - a)
+        elif n > 1:
             out, s, _ = _forward(model, ids[:, :-1], None, rec)
             past, pv = out.past_key_values, pv + s
         cur = ids[:, -1:]
@@ -210,16 +263,45 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None):
             toks.append(nxt); routes.append(r[0]); vols.append(s); pids.append(pid); steps.append(step)
             if step == 0:
                 pv = pv + s
+            if watch is not None:
+                watch.step(nxt, s, (text or (pv, n)) if step == 0 else None, rec)
             cur = torch.tensor([[nxt]], device=device)
             if eos is not None and nxt == eos:
                 break
         pre_vol.append(pv)
+        if watch is not None:
+            watch.end()
         log(f"decode {pid + 1}/{len(inputs)}: {ids.shape[1]} input tokens, {len(toks) - n0} generated, "
             f"{time.time() - t0:.1f}s, traffic mismatches so far {rec.mismatch}")
     log(f"decode done: {len(toks)} tokens in {time.time() - t_all:.0f}s")
     return {"tokens": np.array(toks, np.int64), "routing": np.stack(routes).astype(np.int32),
             "measured": np.stack(vols), "prompt_ids": np.array(pids, np.int64),
             "step": np.array(steps, np.int64), "prefill_measured": np.stack(pre_vol)}
+
+
+def run_chat(model, rec, tok, job, eos, watch):
+    """입력창 방식: 모델을 올려 둔 채 문장을 하나씩 받아 처리한다. 문장마다 독립된 요청이다.
+
+    부모 프로세스가 입력을 받아 req로 보내고, 처리가 끝나 다음 입력을 받을 수 있으면 resp로 알린다.
+    """
+    req, resp = job["chan"]
+    parts, inputs = [], []
+    while True:
+        resp.put("ready")
+        text = req.get()
+        if text is None:
+            break
+        ids, span = encode(tok, text, "decode", job.get("raw", False))
+        if watch is not None:
+            watch.prompts, watch.offset = [text], len(parts)
+        d = run_decode(model, rec, [ids], job.get("max_new_tokens", 64), eos, watch, [span])
+        d["prompt_ids"] = d["prompt_ids"] + len(parts)
+        parts.append(d); inputs.append(ids)
+    if not parts:
+        z = np.zeros((0, rec.layers, rec.gpus), np.int64)
+        return {"tokens": np.zeros(0, np.int64), "routing": np.zeros((0, rec.layers, 1), np.int32), "measured": z,
+                "prompt_ids": np.zeros(0, np.int64), "step": np.zeros(0, np.int64), "prefill_measured": z}, inputs
+    return {k: np.concatenate([d[k] for d in parts]) for k in parts[0]}, inputs
 
 
 @torch.no_grad()
@@ -332,7 +414,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     name = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
     log(f"started on {device} ({name}), backend {backend}, experts {lo}..{hi - 1} of {experts}")
 
-    model = tok = ref = inputs = None
+    model = tok = ref = inputs = spans = None
     for turn in range(world):                     # 한 번에 한 rank씩 올린다(CPU 메모리 최대치를 낮춘다)
         if turn == rank:
             t0 = time.time()
@@ -343,11 +425,14 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
             assert len(mods) == layers, f"MoE layer 수 {len(mods)} != {layers}"
             hidden, dtype = mods[0].gate_up_proj.shape[-1], mods[0].gate_up_proj.dtype
             if rank == 0:
-                inputs = job.get("inputs")
+                inputs, spans = job.get("inputs"), job.get("spans")
                 if inputs is None:
-                    kw = {"truncation": True, "max_length": job.get("max_len", 32)} if job["task"] == "prefill" else {}
-                    inputs = [tok(p, **kw)["input_ids"] for p in job["prompts"]]
-                log(f"task {job['task']}: {len(inputs)} prompts, {sum(len(x) for x in inputs)} input tokens")
+                    enc = [encode(tok, p, job["task"], job.get("raw", False), job.get("max_len", 32))
+                           for p in job.get("prompts") or []]
+                    inputs = [e[0] for e in enc]
+                    spans = [e[1] for e in enc] if job.get("live") else None
+                if not job.get("chan"):
+                    log(f"task {job['task']}: {len(inputs)} prompts, {sum(len(x) for x in inputs)} input tokens")
                 if job.get("check"):
                     ref = _reference_run(model, loader, backend, device, inputs, job,
                                          getattr(tok, "eos_token_id", None))
@@ -368,7 +453,8 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     if rank > 0:
         log("waiting for layer calls from rank 0")
         worker_loop(mods, hidden, top_k, dtype, experts, world, rank, device)
-        log("done")
+        if not job.get("live"):
+            log("done")
         dist.barrier(); dist.destroy_process_group()
         return
 
@@ -376,9 +462,19 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     attach(model, experts, world, rank, device, rec)
     eos = getattr(tok, "eos_token_id", None)
     log(f"all {world} processes ready, serving in EP form")
-    data = (run_prefill(model, rec, inputs) if job["task"] == "prefill"
-            else run_decode(model, rec, inputs, job.get("max_new_tokens", 64), eos))
-    report = {"gpus": world, "backend": backend, "layer_calls_mismatch": rec.mismatch}
+    watch = None
+    if job.get("live") and job["task"] == "decode":   # 실시간 화면: 토큰마다 측정 통신량을 그린다
+        from .chat import Live
+        watch = Live(tok, layers, experts, world, backend, job)
+        _LOG["on"] = False                            # 화면을 지우며 그리므로 진행 로그는 끈다
+    if job.get("chan"):
+        data, inputs = run_chat(model, rec, tok, job, eos, watch)
+    else:
+        data = (run_prefill(model, rec, inputs) if job["task"] == "prefill"
+                else run_decode(model, rec, inputs, job.get("max_new_tokens", 64), eos, watch, spans))
+    report = {"gpus": world, "backend": backend, "layer_calls_mismatch": rec.mismatch, "layer_calls": rec.calls}
+    if watch is not None:
+        report["live"] = watch.summary
     if ref is not None:
         log("comparing with the unmodified model")
         if job["task"] == "prefill":                   # 마지막 위치의 logits를 다시 계산해 비교
@@ -410,8 +506,11 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     ret["report"] = report
 
 
-def launch(loader, spec, job, gpus, backend=None, port=29541):
-    """프로세스 gpus개를 띄워 EP 서빙을 실행하고 (자료, 보고)를 돌려준다."""
+def launch(loader, spec, job, gpus, backend=None, port=29541, interact=None):
+    """프로세스 gpus개를 띄워 EP 서빙을 실행하고 (자료, 보고)를 돌려준다.
+
+    interact(req, resp, procs)를 주면 프로세스들이 떠 있는 동안 부모에서 그 함수를 실행한다(입력창 방식).
+    """
     import torch.multiprocessing as mp
     if backend is None:
         backend = "nccl" if torch.cuda.is_available() and torch.cuda.device_count() >= 1 else "gloo"
@@ -422,16 +521,31 @@ def launch(loader, spec, job, gpus, backend=None, port=29541):
     if backend == "nccl" and gpus > torch.cuda.device_count():
         raise ValueError(f"GPU {gpus}개를 요청했지만 이 장비에는 {torch.cuda.device_count()}개만 있다")
     mgr = mp.Manager(); ret = mgr.dict()
-    mp.spawn(run_rank, args=(gpus, backend, loader, spec, job, ret, port), nprocs=gpus, join=True)
+    if interact is None:
+        mp.spawn(run_rank, args=(gpus, backend, loader, spec, job, ret, port), nprocs=gpus, join=True)
+    else:
+        req, resp = mgr.Queue(), mgr.Queue()
+        job = dict(job, chan=(req, resp))
+        procs = mp.spawn(run_rank, args=(gpus, backend, loader, spec, job, ret, port), nprocs=gpus, join=False)
+        try:
+            interact(req, resp, procs)
+        finally:
+            req.put(None)                              # 어떤 경우에도 서빙 프로세스를 끝낸다
+            while not procs.join():
+                pass
     return dict(ret["data"]), dict(ret["report"])
 
 
 def run(model_key, task, prompts, gpus, out, max_new_tokens=64, check=False, dtype="bfloat16", backend=None,
-        verbose=True):
+        verbose=True, raw=False, labels=None):
+    """프롬프트 목록을 EP로 처리해 통신량을 out(.npz)에 저장한다. labels가 있으면 함께 저장한다(입력 분야 학습용)."""
     spec = config.get(model_key)
     loader = ("hf", spec.repo, spec.revision, dtype)
-    job = {"task": task, "prompts": prompts, "max_new_tokens": max_new_tokens, "check": check, "verbose": verbose}
+    job = {"task": task, "prompts": prompts, "max_new_tokens": max_new_tokens, "check": check, "verbose": verbose,
+           "raw": raw}
     data, report = launch(loader, (spec.layers, spec.experts, spec.top_k), job, gpus, backend)
+    if labels is not None:
+        data["labels"] = np.array(labels)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     np.savez_compressed(out, **data)
     return report

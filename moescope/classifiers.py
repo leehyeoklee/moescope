@@ -50,12 +50,17 @@ def fit_output(x_train, y_train):
     return _pipe().fit(x_train[keep], y_train[keep]), vocab
 
 
-def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None, source="computed"):
+def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None, source="auto"):
     """출력 토큰 분류기 학습·(선택)저장. 트레이스 키: tokens/routing/prompt_ids/step.
 
-    source="measured"이면 EP 서빙에서 측정한 통신량(키 measured)을 그대로 쓴다.
+    source="measured"이면 EP 서빙에서 측정한 통신량(키 measured)을 그대로 쓰고, "computed"이면 라우팅에서
+    계산한다. "auto"는 측정값이 있으면 그것을 쓴다.
     """
     d = np.load(trace_path)
+    if source == "auto":
+        source = "measured" if "measured" in d.files else "computed"
+    if source == "measured" and d["measured"].shape[-1] != gpus:
+        raise ValueError(f"이 파일은 GPU {d['measured'].shape[-1]}개로 수집한 것이다. --gpus {gpus}와 다르다.")
     tokens, routing = d["tokens"], d["routing"]
     prompt_ids, step = d["prompt_ids"], d["step"]
     train, test = prompt_split(prompt_ids, seed)
@@ -75,15 +80,22 @@ def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None,
     return meta
 
 
-def train_domain(trace_path, experts, gpus, seed=SEED, save=None, source="computed"):
+def train_domain(trace_path, experts, gpus, seed=SEED, save=None, source="auto"):
     """입력 분야 분류기. 트레이스 키: 고정길이 routing(P,L,T,k)+labels, 또는 prefill_routing+prefill_lengths+labels."""
     d = np.load(trace_path)
+    if "labels" not in d.files:
+        raise ValueError('수집 파일에 labels가 없다. 프롬프트 파일의 항목을 {"text": ..., "label": ...}로 적어 '
+                         "collect --task prefill을 다시 실행한다.")
     labels = np.asarray(d["labels"])
 
     def key(name):                      # 예전 파일은 prefill_ 대신 e1_ 로 저장돼 있다
         return f"prefill_{name}" if f"prefill_{name}" in d.files else f"e1_{name}"
 
+    if source == "auto":
+        source = "measured" if key("measured") in d.files else "computed"
     if source == "measured":
+        if d[key("measured")].shape[-1] != gpus:
+            raise ValueError(f"이 파일은 GPU {d[key('measured')].shape[-1]}개로 수집한 것이다. --gpus {gpus}와 다르다.")
         x = measured_prompt_features(d[key("measured")], d[key("lengths")])
     elif key("routing") in d.files:
         x = prompt_features(d[key("routing")], d[key("lengths")], experts, gpus)

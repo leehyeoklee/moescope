@@ -8,9 +8,9 @@
   placement   Expert→rank 선형 배치, 라우팅→통신량 계산값
   traffic     통신량 특징
   ep          실제 all_to_all 디스패치 + 측정 (gloo/NCCL)
-  collect     실제 모델에서 라우팅 추출
   serve_ep    모델을 GPU별 프로세스에 나누어 EP로 서빙하며 통신량 측정
   classifiers 통신량→분야/토큰 분류기
+  chat        EP 서빙 입력창과 실시간 화면
   cli         `moescope` 명령
 """
 __version__ = "0.1.0"

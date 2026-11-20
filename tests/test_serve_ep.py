@@ -77,3 +77,47 @@ def test_single_gpu_has_no_cross_traffic():
 def test_gpu_count_must_divide_experts():
     with pytest.raises(ValueError):
         _launch("decode", 3, 29761)
+
+
+def test_live_screen_keeps_results():
+    """실시간 화면(chat)을 켜도 생성 토큰과 측정 통신량은 그대로다."""
+    loader = ("tiny", 0, LAYERS, EXPERTS, TOP_K, HIDDEN, "float32", "olmoe")
+    job = {"task": "decode", "inputs": INPUTS, "max_new_tokens": 6}
+    plain, _ = serve_ep.launch(loader, (LAYERS, EXPERTS, TOP_K), job, 2, backend="gloo", port=29761)
+    live, report = serve_ep.launch(loader, (LAYERS, EXPERTS, TOP_K), dict(job, live={"model": "tiny"}), 2,
+                                   backend="gloo", port=29762)
+    assert np.array_equal(plain["tokens"], live["tokens"]) and np.array_equal(plain["measured"], live["measured"])
+    assert report["layer_calls_mismatch"] == 0 and report["layer_calls"] > 0
+    assert [r["tokens"] for r in report["live"]] == [6, 6, 6]
+
+
+def test_chat_takes_typed_prompts():
+    """입력창 방식: 모델을 한 번 올린 채 문장을 차례로 받아 처리하고, exit로 끝난다."""
+    from moescope import chat
+    typed = iter(["hello there", "second question", "exit", "never read"])
+    report = chat.run(gpus=2, tiny=True, max_new_tokens=5, port=29771, read=lambda: next(typed))
+    assert report["layer_calls_mismatch"] == 0
+    assert [(r["prompt"], r["tokens"]) for r in report["live"]] == [(0, 5), (1, 5)]
+    assert next(typed) == "never read"
+
+
+def test_text_span_keeps_tokens():
+    """입력 가운데 문장 구간을 따로 넣어 통신량을 재도 생성 토큰은 한 번에 넣은 것과 같다."""
+    loader = ("tiny", 0, LAYERS, EXPERTS, TOP_K, HIDDEN, "float32", "olmoe")
+    job = {"task": "decode", "inputs": INPUTS, "max_new_tokens": 6}
+    plain, _ = serve_ep.launch(loader, (LAYERS, EXPERTS, TOP_K), job, 2, backend="gloo", port=29781)
+    split, report = serve_ep.launch(loader, (LAYERS, EXPERTS, TOP_K), dict(job, spans=[(2, 5), (0, 3), (3, 8)]), 2,
+                                    backend="gloo", port=29782)
+    assert report["layer_calls_mismatch"] == 0
+    assert np.array_equal(plain["tokens"], split["tokens"])
+    assert np.array_equal(plain["prefill_measured"], split["prefill_measured"])
+    assert serve_ep.encode(None, "abc", "decode") == ([ord(c) % 97 for c in "abc"], (0, 3))
+
+
+def test_prompt_file_with_labels(tmp_path):
+    from moescope.cli import read_prompts
+    f = tmp_path / "p.json"
+    f.write_text('[{"text": "a", "label": "X"}, {"text": "b", "label": "Y"}]', encoding="utf-8")
+    assert read_prompts(f) == (["a", "b"], ["X", "Y"])
+    f.write_text('["a", "b"]', encoding="utf-8")
+    assert read_prompts(f) == (["a", "b"], None)

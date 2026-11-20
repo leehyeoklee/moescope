@@ -1,11 +1,9 @@
 """moescope — MoE 모델의 EP 서빙과 GPU 간 통신량 측정 CLI.
 
-  moescope verify-ep   측정 통신량 = 라우팅 계산 검증 (gloo CPU / NCCL GPU)
-  moescope collect     실제 모델에서 라우팅 추출 → 트레이스(.npz)   [GPU]
-  moescope train       통신량 분류기 학습·저장
-  moescope measure-ep  실제 EP로 통신량 실측·계산 일치 확인          [멀티 GPU]
-  moescope serve-ep    모델을 EP로 서빙하며 통신량 측정              [멀티 GPU]
-  moescope demo        실시간 서빙 + 통신량 복원                     [GPU]
+  moescope collect   프롬프트 파일을 EP로 처리하며 통신량을 저장한다          [멀티 GPU]
+  moescope train     저장한 통신량으로 분류기를 학습한다
+  moescope chat      모델을 EP로 올려 두고 입력창에서 문장을 받아 응답·통신량·추정 결과를 보여 준다  [멀티 GPU]
+  moescope verify    임의 라우팅으로 all_to_all 통신을 해 보고 측정값과 계산값이 같은지 확인한다(설치 확인)
 """
 import argparse
 import json
@@ -43,13 +41,13 @@ def _verify_worker(rank, world, N, E, k, ret):
     dist.barrier(); dist.destroy_process_group()
 
 
-def cmd_verify_ep(a):
+def cmd_verify(a):
     import torch.multiprocessing as mp
     mgr = mp.Manager(); ret = mgr.dict()
     mp.spawn(_verify_worker, args=(a.gpus, a.tokens, a.experts, a.top_k, ret),
              nprocs=a.gpus, join=True)
     ok = ret["measured"] == ret["computed"] and all(ret[f"rt_{r}"] for r in range(a.gpus))
-    print(f"[verify-ep] gpus={a.gpus} tokens={a.tokens} experts={a.experts} k={a.top_k}")
+    print(f"[verify] gpus={a.gpus} tokens={a.tokens} experts={a.experts} k={a.top_k}")
     print(f"  measured : {ret['measured']}")
     print(f"  computed : {ret['computed']}")
     print(f"  measured==computed : {ret['measured']==ret['computed']}")
@@ -57,48 +55,28 @@ def cmd_verify_ep(a):
     sys.exit(0 if ok else 1)
 
 
+def read_prompts(path):
+    """프롬프트 파일을 읽어 (문장 목록, 라벨 목록 또는 None)을 돌려준다.
+
+    형식: ["문장", ...] 또는 [{"text": "문장", "label": "분야"}, ...] 또는 {"prompts": [...]}.
+    라벨은 입력 분야 분류기를 학습할 때 쓴다. 모든 항목에 있을 때만 쓴다.
+    """
+    items = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(items, dict):
+        items = items.get("prompts", list(items.values()))
+    texts = [it["text"] if isinstance(it, dict) else it for it in items]
+    labels = [it.get("label") if isinstance(it, dict) else None for it in items]
+    return texts, (labels if texts and all(x is not None for x in labels) else None)
+
+
 def cmd_collect(a):
-    import numpy as np
-    from . import collect
-    spec = config.get(a.model)
-    prompts = json.loads(Path(a.prompts).read_text(encoding="utf-8"))
-    if isinstance(prompts, dict):
-        prompts = prompts.get("prompts", list(prompts.values()))
-    print(f"[collect] {a.model} task={a.task} prompts={len(prompts)}")
-    model, tok = collect.load_model(spec)
-    data = (collect.collect_decode(model, tok, prompts, spec, max_new_tokens=a.max_new_tokens)
-            if a.task == "decode" else collect.collect_prefill(model, tok, prompts, spec))
-    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(a.out, **data)
-    print(f"  saved {a.out}")
-
-
-def cmd_train(a):
-    from . import classifiers
-    spec = config.get(a.model)
-    out = a.out or f"models/{a.model}_{a.task}{'_causal' if getattr(a,'window','none')=='causal' else ''}.joblib"
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    if a.task == "output":
-        m = classifiers.train_output(a.traces, spec.experts, a.gpus, window=a.window, save=out, source=a.source)
-    else:
-        m = classifiers.train_domain(a.traces, spec.experts, a.gpus, save=out, source=a.source)
-    print(f"[train] {a.model} {a.task} acc={m['accuracy']:.4f} -> {out}")
-    print("  " + json.dumps(m, ensure_ascii=False))
-
-
-def cmd_measure_ep(a):
-    from . import measure_ep
-    sys.exit(0 if measure_ep.run(a.model, a.routing, a.max_steps, a.gpus) else 1)
-
-
-def cmd_serve_ep(a):
     from . import serve_ep
-    prompts = json.loads(Path(a.prompts).read_text(encoding="utf-8"))
-    if isinstance(prompts, dict):
-        prompts = prompts.get("prompts", list(prompts.values()))
-    print(f"[serve-ep] {a.model} task={a.task} prompts={len(prompts)} gpus={a.gpus}")
+    prompts, labels = read_prompts(a.prompts)
+    print(f"[collect] {a.model} task={a.task} prompts={len(prompts)} gpus={a.gpus}"
+          f"{' labels=' + str(len(set(labels))) + ' classes' if labels else ''}")
     report = serve_ep.run(a.model, a.task, prompts, a.gpus, a.out, max_new_tokens=a.max_new_tokens,
-                          check=a.check, dtype=a.dtype, backend=a.backend, verbose=not a.quiet)
+                          check=a.check, dtype=a.dtype, backend=a.backend, verbose=not a.quiet, raw=a.raw,
+                          labels=labels)
     print("  " + json.dumps(report, ensure_ascii=False))
     print(f"  saved {a.out}")
     ok = report["layer_calls_mismatch"] == 0
@@ -106,10 +84,27 @@ def cmd_serve_ep(a):
     sys.exit(0 if ok else 1)
 
 
-def cmd_demo(a):
-    from . import demo
-    demo.run(a.model, a.gpus, a.output_clf, a.domain_clf, a.mock_model,
-             a.steps, a.max_new_tokens, a.delay)
+def cmd_train(a):
+    from . import classifiers
+    spec = config.get(a.model)
+    out = a.out or f"models/{a.model}_g{a.gpus}_{a.task}.joblib"       # chat이 이 이름으로 찾는다
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    if a.task == "output":
+        m = classifiers.train_output(a.traces, spec.experts, a.gpus, window=a.window, save=out, source=a.source)
+    else:
+        m = classifiers.train_domain(a.traces, spec.experts, a.gpus, save=out, source=a.source)
+    print(f"[train] {a.model} {a.task} gpus={a.gpus} acc={m['accuracy']:.4f} -> {out}")
+    print("  " + json.dumps(m, ensure_ascii=False))
+
+
+def cmd_chat(a):
+    from . import chat
+    prompts = list(a.prompt or [])
+    if a.prompts:
+        prompts += read_prompts(a.prompts)[0]
+    report = chat.run(a.model, a.gpus, prompts or None, a.output_clf, a.domain_clf, a.max_new_tokens, a.delay,
+                      dtype=a.dtype, backend=a.backend, tiny=a.tiny, out=a.out, use_clf=not a.no_clf)
+    sys.exit(0 if report["layer_calls_mismatch"] == 0 else 1)
 
 
 def main():
@@ -117,44 +112,44 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = _add(sub, "verify-ep", "측정=계산 검증 (gloo)")
-    s.add_argument("--gpus", type=int, default=4); s.add_argument("--tokens", type=int, default=300)
-    s.add_argument("--experts", type=int, default=64); s.add_argument("--top-k", type=int, default=8)
-    s.set_defaults(func=cmd_verify_ep)
-
-    s = _add(sub, "collect", "실제 모델 라우팅 추출 [GPU]")
+    s = _add(sub, "collect", "프롬프트 파일을 EP로 처리하며 통신량을 저장한다 [멀티 GPU]")
     s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["prefill", "decode"], default="decode")
-    s.add_argument("--prompts", required=True); s.add_argument("--out", required=True)
-    s.add_argument("--max-new-tokens", type=int, default=64); s.set_defaults(func=cmd_collect)
-
-    s = _add(sub, "train", "통신량 분류기 학습")
-    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["output", "domain"], default="output")
-    s.add_argument("--traces", required=True); s.add_argument("--gpus", type=int, default=4)
-    s.add_argument("--window", choices=["none", "causal"], default="none"); s.add_argument("--out")
-    s.add_argument("--source", choices=["computed", "measured"], default="computed",
-                   help="measured: serve-ep로 측정한 통신량으로 학습")
-    s.set_defaults(func=cmd_train)
-
-    s = _add(sub, "serve-ep", "모델을 EP로 서빙하며 통신량 측정 [멀티 GPU]")
-    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["prefill", "decode"], default="decode")
-    s.add_argument("--prompts", required=True); s.add_argument("--out", required=True)
+    s.add_argument("--prompts", required=True, help='JSON: ["문장", ...] 또는 [{"text": ..., "label": ...}, ...]')
+    s.add_argument("--out", required=True)
     s.add_argument("--gpus", type=int, default=4); s.add_argument("--max-new-tokens", type=int, default=64)
-    s.add_argument("--check", action="store_true", help="한 GPU에서 실행한 결과와 비교")
+    s.add_argument("--check", action="store_true", help="같은 입력을 원래 모델로 실행한 결과와 비교")
+    s.add_argument("--raw", action="store_true", help="대화 형식을 씌우지 않고 토크나이저 기본 동작 그대로 넣는다")
     s.add_argument("--dtype", default="bfloat16"); s.add_argument("--backend", choices=["nccl", "gloo"])
     s.add_argument("--quiet", action="store_true", help="진행 로그를 끈다")
-    s.set_defaults(func=cmd_serve_ep)
+    s.set_defaults(func=cmd_collect)
 
-    s = _add(sub, "measure-ep", "실제 EP 측정=계산 [멀티 GPU]")
-    s.add_argument("--model", default="olmoe"); s.add_argument("--routing", required=True)
-    s.add_argument("--max-steps", type=int, default=500); s.add_argument("--gpus", type=int, default=4)
-    s.set_defaults(func=cmd_measure_ep)
+    s = _add(sub, "train", "저장한 통신량으로 분류기를 학습한다")
+    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["output", "domain"], default="output")
+    s.add_argument("--traces", required=True); s.add_argument("--gpus", type=int, default=4)
+    s.add_argument("--window", choices=["none", "causal"], default="causal",
+                   help="응답 토큰: causal은 앞의 두 단계 통신량을 함께 쓴다")
+    s.add_argument("--out", help="기본: models/<model>_g<gpus>_<task>.joblib (chat이 자동으로 찾는다)")
+    s.add_argument("--source", choices=["auto", "measured", "computed"], default="auto",
+                   help="measured: collect로 측정한 통신량, computed: 라우팅에서 계산한 통신량")
+    s.set_defaults(func=cmd_train)
 
-    s = _add(sub, "demo", "실시간 서빙 + 복원 [GPU]")
+    s = _add(sub, "chat", "모델을 EP로 올려 두고 입력창에서 문장을 받는다: 응답, GPU별 측정 통신량, 추정 결과 [멀티 GPU]")
     s.add_argument("--model", default="olmoe"); s.add_argument("--gpus", type=int, default=4)
-    s.add_argument("--output-clf"); s.add_argument("--domain-clf")
-    s.add_argument("--mock-model", action="store_true"); s.add_argument("--steps", type=int, default=17)
-    s.add_argument("--max-new-tokens", type=int, default=48); s.add_argument("--delay", type=float, default=0.25)
-    s.set_defaults(func=cmd_demo)
+    s.add_argument("--prompt", action="append", help="이 문장만 처리하고 끝낸다(여러 번 줄 수 있다). 없으면 입력창을 띄운다")
+    s.add_argument("--prompts", help="문장 목록 JSON 파일(입력창 없이 처리)")
+    s.add_argument("--output-clf", help="응답 토큰 분류기(.joblib). 없으면 models/, 저장소에 들어 있는 것 순으로 찾는다")
+    s.add_argument("--domain-clf", help="입력 분야 분류기(.joblib). 없으면 models/, 저장소에 들어 있는 것 순으로 찾는다")
+    s.add_argument("--no-clf", action="store_true", help="분류기 없이 응답과 통신량만 본다")
+    s.add_argument("--max-new-tokens", type=int, default=48); s.add_argument("--delay", type=float, default=0.0)
+    s.add_argument("--dtype", default="bfloat16"); s.add_argument("--backend", choices=["nccl", "gloo"])
+    s.add_argument("--tiny", action="store_true", help="가중치 없이 작은 임의 모델로 화면과 EP 경로만 확인(CPU)")
+    s.add_argument("--out", help="측정 통신량과 생성 토큰을 저장할 .npz")
+    s.set_defaults(func=cmd_chat)
+
+    s = _add(sub, "verify", "설치 확인: 임의 라우팅으로 측정값 = 계산값 확인 (CPU)")
+    s.add_argument("--gpus", type=int, default=4); s.add_argument("--tokens", type=int, default=300)
+    s.add_argument("--experts", type=int, default=64); s.add_argument("--top-k", type=int, default=8)
+    s.set_defaults(func=cmd_verify)
 
     a = p.parse_args()
     a.func(a)

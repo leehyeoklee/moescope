@@ -1,0 +1,43 @@
+{
+ "inputs_sha256": "d608ad7c2805e6b0f925fb517f8de8018387e8dd4c773da52b72d9a22d680f15",
+ "sklearn": "1.6.1",
+ "numpy": "2.4.6",
+ "classifiers": [
+  {
+   "model": "olmoe",
+   "gpus": 2,
+   "domain_accuracy": 0.505,
+   "output_accuracy": 0.3104
+  },
+  {
+   "model": "olmoe",
+   "gpus": 4,
+   "domain_accuracy": 0.58,
+   "output_accuracy": 0.3916
+  },
+  {
+   "model": "granite",
+   "gpus": 2,
+   "domain_accuracy": 0.51,
+   "output_accuracy": 0.4069
+  },
+  {
+   "model": "granite",
+   "gpus": 4,
+   "domain_accuracy": 0.55,
+   "output_accuracy": 0.4552
+  },
+  {
+   "model": "qwen",
+   "gpus": 2,
+   "domain_accuracy": 0.415,
+   "output_accuracy": 0.3413
+  },
+  {
+   "model": "qwen",
+   "gpus": 4,
+   "domain_accuracy": 0.44,
+   "output_accuracy": 0.4285
+  }
+ ]
+}
