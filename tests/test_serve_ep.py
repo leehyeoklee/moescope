@@ -121,3 +121,36 @@ def test_prompt_file_with_labels(tmp_path):
     assert read_prompts(f) == (["a", "b"], ["X", "Y"])
     f.write_text('["a", "b"]', encoding="utf-8")
     assert read_prompts(f) == (["a", "b"], None)
+
+
+def test_end_token_stops_and_stays_off_the_screen():
+    """종료 토큰이 나오면 생성을 멈추고, 그 토큰은 화면에 내지 않는다."""
+    import torch
+
+    class Out:
+        def __init__(self, nxt):
+            self.logits = torch.zeros(1, 1, 10); self.logits[0, 0, nxt] = 1.0
+            self.past_key_values = None
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.w = torch.nn.Parameter(torch.zeros(1)); self.plan = iter([3, 4, 9, 5, 5])
+
+        def forward(self, input_ids, past_key_values=None, use_cache=True):
+            return Out(next(self.plan))
+
+    class Rec:
+        layers, gpus, mismatch = 1, 2, 0
+
+        def take(self):
+            return np.ones((1, 2), np.int64), np.zeros((1, 1, 1), np.int64)
+
+    class Watch:
+        seen = []
+
+        def start(self, pid): pass
+        def step(self, tok_id, *a): self.seen.append(tok_id)
+        def end(self): pass
+
+    data = serve_ep.run_decode(Model(), Rec(), [[1, 2]], 5, eos={9}, watch=Watch())
+    assert data["tokens"].tolist() == [4, 9] and Watch.seen == [4]      # 3은 프롬프트 앞부분의 출력이라 쓰지 않는다

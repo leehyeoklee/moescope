@@ -146,7 +146,7 @@ class Live:
     def _text(self, tok_id):
         if self.tok is None:
             return f"t{tok_id}"
-        return self.tok.decode([tok_id]).strip() or "·"
+        return self.tok.decode([tok_id], skip_special_tokens=True).strip() or "·"
 
     def start(self, pid):
         self.pid = pid

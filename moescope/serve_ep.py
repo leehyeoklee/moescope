@@ -218,6 +218,17 @@ def _device(rank, backend):
 
 
 # ---------------------------------------------------------------- 추론(rank 0)
+def eos_ids(model, tok):
+    """생성을 끝내는 토큰 번호들. 토크나이저의 것과 모델 생성 설정의 것을 모두 쓴다."""
+    ids = set()
+    if getattr(tok, "eos_token_id", None) is not None:
+        ids.add(int(tok.eos_token_id))
+    gen = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    for v in np.atleast_1d(gen if gen is not None else []).tolist():
+        ids.add(int(v))
+    return ids
+
+
 def _forward(model, ids, past, rec):
     out = model(input_ids=ids, past_key_values=past, use_cache=True)
     sends, routing = rec.take()
@@ -225,7 +236,7 @@ def _forward(model, ids, past, rec):
 
 
 @torch.no_grad()
-def run_decode(model, rec, inputs, max_new_tokens, eos=None, watch=None, spans=None):
+def run_decode(model, rec, inputs, max_new_tokens, eos=(), watch=None, spans=None):
     """응답 생성(decode): 토큰을 하나씩 만들며 토큰별 측정 통신량·라우팅을 모은다.
 
     생성한 토큰 하나의 통신량은 그 토큰을 모델에 넣어 처리할 때 측정한 값이다. 즉 tokens[i]와
@@ -263,10 +274,10 @@ def run_decode(model, rec, inputs, max_new_tokens, eos=None, watch=None, spans=N
             out, s, r = _forward(model, torch.tensor([[nxt]], device=device), past, rec)   # 그 토큰을 처리
             past = out.past_key_values
             toks.append(nxt); routes.append(r[0]); vols.append(s); pids.append(pid); steps.append(step)
+            if nxt in eos:                                         # 종료 토큰은 기록만 하고 화면에는 내지 않는다
+                break
             if watch is not None:
                 watch.step(nxt, s, (text or (pv, n)) if step == 0 else None, rec)
-            if eos is not None and nxt == eos:
-                break
         pre_vol.append(pv)
         if watch is not None:
             watch.end()
@@ -348,7 +359,7 @@ def run_forced(model, rec, inputs, ref):
 
 
 @torch.no_grad()
-def reference(model, inputs, task, max_new_tokens, eos=None):
+def reference(model, inputs, task, max_new_tokens, eos=()):
     """한 장치에서 원래 모델 그대로 실행한 결과(비교용)."""
     device = model.get_input_embeddings().weight.device
     res = []
@@ -369,7 +380,7 @@ def reference(model, inputs, task, max_new_tokens, eos=None):
             lg.append(out.logits[0, -1].float().cpu())
             nxt = int(lg[-1].argmax()); gen.append(nxt)
             cur = torch.tensor([[nxt]], device=device)
-            if eos is not None and nxt == eos:
+            if nxt in eos:
                 break
         res.append({"tokens": gen, "logits": torch.stack(lg)})
     return res
@@ -434,7 +445,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
                     log(f"task {job['task']}: {len(inputs)} prompts, {sum(len(x) for x in inputs)} input tokens")
                 if job.get("check"):
                     ref = _reference_run(model, loader, backend, device, inputs, job,
-                                         getattr(tok, "eos_token_id", None))
+                                         eos_ids(model, tok))
                 for m in mods:
                     shard(m, lo, hi, device)
                 model.to(device)
@@ -459,7 +470,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
 
     rec = Recorder(layers, experts, world)
     attach(model, experts, world, rank, device, rec)
-    eos = getattr(tok, "eos_token_id", None)
+    eos = eos_ids(model, tok)
     log(f"all {world} processes ready, serving in EP form")
     watch = None
     if job.get("live") and job["task"] == "decode":   # 실시간 화면: 토큰마다 측정 통신량을 그린다
@@ -499,7 +510,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
         texts, start = [], 0
         for p in range(len(inputs)):
             n = int((data["prompt_ids"] == p).sum())
-            texts.append(tok.decode(data["tokens"][start:start + n].tolist())); start += n
+            texts.append(tok.decode(data["tokens"][start:start + n].tolist(), skip_special_tokens=True)); start += n
         data["generated"] = np.array("\u0001".join(texts))
     ret["data"] = {k: v for k, v in data.items()}
     ret["report"] = report
