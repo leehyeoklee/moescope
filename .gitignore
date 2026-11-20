@@ -2,6 +2,7 @@
 *.npz
 *.npy
 *.joblib
+!moescope/pretrained/*.joblib
 *.pkl
 *.pt
 *.safetensors
