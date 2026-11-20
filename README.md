@@ -10,6 +10,14 @@ experts for every token, the token is sent to the GPUs that hold those experts w
 rows go to each GPU depends on which experts were picked, and that depends on the input. moescope
 runs this for real, records the per-layer, per-GPU row counts, and trains classifiers on them.
 
+## Demo
+
+[![Demo video: OLMoE served in EP form on 4 NVIDIA L4 GPUs](docs/demo.png)](https://youtu.be/Pm0M3b3SdTY)
+
+Click the image to watch the demo on YouTube: OLMoE-1B-7B Instruct is served in EP form on
+4× NVIDIA L4 (AWS g6.12xlarge) with `moescope chat`, and the screen shows the response, the rows
+sent to each GPU, and the input topic and tokens estimated from the measured traffic.
+
 ## What it does
 
 - **EP serving.** One process per GPU. Experts are split in index order (`E/G` per GPU). The
