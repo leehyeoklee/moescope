@@ -9,7 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .traffic import volume_features, prompt_features
+from .traffic import volume_features, prompt_features, measured_features, measured_prompt_features
 
 SEED = 0
 MIN_COUNT = 5
@@ -50,20 +50,23 @@ def fit_output(x_train, y_train):
     return _pipe().fit(x_train[keep], y_train[keep]), vocab
 
 
-def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None):
-    """출력 토큰 분류기 학습·(선택)저장. 트레이스 키: tokens/routing/prompt_ids/step."""
+def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None, source="computed"):
+    """출력 토큰 분류기 학습·(선택)저장. 트레이스 키: tokens/routing/prompt_ids/step.
+
+    source="measured"이면 EP 서빙에서 측정한 통신량(키 measured)을 그대로 쓴다.
+    """
     d = np.load(trace_path)
     tokens, routing = d["tokens"], d["routing"]
     prompt_ids, step = d["prompt_ids"], d["step"]
     train, test = prompt_split(prompt_ids, seed)
-    x = volume_features(routing, experts, gpus)
+    x = measured_features(d["measured"]) if source == "measured" else volume_features(routing, experts, gpus)
     if window == "causal":
         x = causal_window(x, prompt_ids, step)
     model, vocab = fit_output(x[train], tokens[train])
     acc = float((model.predict(x[test]) == tokens[test]).mean())
     values, counts = np.unique(tokens[train], return_counts=True)
     baseline = float((tokens[test] == values[counts.argmax()]).mean())
-    meta = {"task": "output", "window": window, "experts": int(experts), "gpus": int(gpus),
+    meta = {"task": "output", "source": source, "window": window, "experts": int(experts), "gpus": int(gpus),
             "seed": seed, "dictionary_size": int(len(vocab)), "accuracy": acc,
             "baseline": baseline, "n_test": int(test.sum())}
     if save:
@@ -72,11 +75,13 @@ def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None)
     return meta
 
 
-def train_domain(trace_path, experts, gpus, seed=SEED, save=None):
+def train_domain(trace_path, experts, gpus, seed=SEED, save=None, source="computed"):
     """입력 분야 분류기. 트레이스 키: 고정길이 routing(P,L,T,k)+labels, 또는 e1_routing+e1_lengths+labels."""
     d = np.load(trace_path)
     labels = np.asarray(d["labels"])
-    if "e1_routing" in d.files:
+    if source == "measured":
+        x = measured_prompt_features(d["e1_measured"], d["e1_lengths"])
+    elif "e1_routing" in d.files:
         x = prompt_features(d["e1_routing"], d["e1_lengths"], experts, gpus)
     else:  # 고정길이 포맷 (P, layers, tokens, k)
         from .placement import dest_counts_feat
@@ -88,7 +93,7 @@ def train_domain(trace_path, experts, gpus, seed=SEED, save=None):
     tr, te = idx[:cut], idx[cut:]
     model = _pipe().fit(x[tr], labels[tr])
     acc = float((model.predict(x[te]) == labels[te]).mean())
-    meta = {"task": "domain", "experts": int(experts), "gpus": int(gpus), "seed": seed,
+    meta = {"task": "domain", "source": source, "experts": int(experts), "gpus": int(gpus), "seed": seed,
             "accuracy": acc, "n_test": int(len(te)), "classes": sorted(set(labels.tolist()))}
     if save:
         import joblib

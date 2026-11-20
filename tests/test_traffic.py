@@ -1,6 +1,6 @@
 import numpy as np
 
-from moetl.traffic import volume_features, prompt_features
+from moescope.traffic import volume_features, prompt_features
 
 
 def test_volume_features_shape():

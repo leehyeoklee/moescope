@@ -1,6 +1,6 @@
 import numpy as np
 
-from moetl.placement import rank_of, dest_counts_full, dest_counts_feat
+from moescope.placement import rank_of, dest_counts_full, dest_counts_feat
 
 
 def test_rank_of_linear():

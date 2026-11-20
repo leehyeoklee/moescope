@@ -3,8 +3,8 @@
 왼쪽: 모델이 실제로 답 생성(토큰 스트리밍).
 오른쪽: 각 스텝 라우팅 → 통신량(측정=계산, measure-ep로 검증) → 학습된 분류기로 복원.
 
-  moetl demo --model olmoe --output-clf models/olmoe_output_causal.joblib
-  moetl demo --model olmoe --mock-model     # 모델 없이 UI/파이프라인 확인
+  moescope demo --model olmoe --output-clf models/olmoe_output_causal.joblib
+  moescope demo --model olmoe --mock-model     # 모델 없이 UI/파이프라인 확인
 """
 import os
 import sys

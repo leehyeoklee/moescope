@@ -23,10 +23,20 @@ def routing_from_logits(router_logits, top_k, experts=None):
     return arr.astype(np.uint8 if (experts is None or experts <= 256) else np.int32)
 
 
+def load_tokenizer(repo, revision):
+    """토크나이저를 불러온다. Granite처럼 기본 방식으로 열리지 않는 체크포인트는 GPT2TokenizerFast로 연다."""
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(repo, revision=revision)
+    except ValueError:
+        from transformers import GPT2TokenizerFast
+        return GPT2TokenizerFast.from_pretrained(repo, revision=revision)
+
+
 def load_model(spec, dtype="bfloat16", device_map="auto"):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(spec.repo, revision=spec.revision)
+    from transformers import AutoModelForCausalLM
+    tok = load_tokenizer(spec.repo, spec.revision)
     model = AutoModelForCausalLM.from_pretrained(
         spec.repo, revision=spec.revision, torch_dtype=getattr(torch, dtype),
         device_map=device_map, output_router_logits=True).eval()

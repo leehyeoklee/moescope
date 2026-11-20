@@ -1,4 +1,4 @@
-# data & artifacts (regenerate with `moetl collect` / `moetl train`)
+# data & artifacts (regenerate with `moescope collect` / `moescope train`)
 *.npz
 *.npy
 *.joblib

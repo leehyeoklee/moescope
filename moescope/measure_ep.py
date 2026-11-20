@@ -4,8 +4,8 @@
 계산값과 비교한다 → "실제 EP 배포에서도 통신량 = 계산값" 입증.
 
 실행:
-  moetl measure-ep --model olmoe --routing TRACE.npz --gpus 4      # 로컬 self-spawn
-  torchrun --nproc_per_node=4 -m moetl.measure_ep --model olmoe --routing TRACE.npz  # 멀티 GPU
+  moescope measure-ep --model olmoe --routing TRACE.npz --gpus 4      # 로컬 self-spawn
+  torchrun --nproc_per_node=4 -m moescope.measure_ep --model olmoe --routing TRACE.npz  # 멀티 GPU
 """
 import argparse
 import os

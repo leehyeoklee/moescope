@@ -7,8 +7,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from moetl.ep import ep_layer
-from moetl.placement import dest_counts_full
+from moescope.ep import ep_layer
+from moescope.placement import dest_counts_full
 
 
 def _worker(rank, world, N, E, k, port, ret):

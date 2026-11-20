@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "moe-traffic-leak"
+name = "moescope"
 version = "0.1.0"
 description = "Study information leakage via GPU-to-GPU communication volume in Mixture-of-Experts expert-parallel inference."
 readme = "README.md"
@@ -22,10 +22,10 @@ model = ["transformers>=4.45", "tokenizers>=0.20", "accelerate>=0.30", "safetens
 dev = ["pytest>=7.0"]
 
 [project.scripts]
-moetl = "moetl.cli:main"
+moescope = "moescope.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["moetl*"]
+include = ["moescope*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

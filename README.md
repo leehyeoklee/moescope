@@ -1,4 +1,4 @@
-# moe-traffic-leak
+# moescope
 
 **Does the volume of GPU-to-GPU communication leak what a Mixture-of-Experts model is doing?**
 
@@ -35,8 +35,8 @@ obtained by computing traffic from routing transfer to a real multi-GPU deployme
 ## Install
 
 ```bash
-git clone https://github.com/<you>/moe-traffic-leak.git
-cd moe-traffic-leak
+git clone https://github.com/leehyeoklee/moescope.git
+cd moescope
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e .                   # core: numpy, scikit-learn, torch (CPU is enough for verify-ep / train / tests)
@@ -44,29 +44,69 @@ pip install -e ".[model]"          # + transformers etc. for `collect` / `demo` 
 ```
 
 On Windows, `torchrun` has a libuv issue, so use the equivalent self-launching command instead:
-`moetl measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4` (Linux can use either).
+`moescope measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4` (Linux can use either).
 
 ## Quickstart
 
 ```bash
 # 1) Verify the core claim locally (no GPU, no model): real all_to_all vs computed
-moetl verify-ep --gpus 4
+moescope verify-ep --gpus 4
 
 # 2) Collect routing from a real model (GPU)
-moetl collect --model olmoe --task e2 --prompts examples/prompts.json --out traces/olmoe.npz
+moescope collect --model olmoe --task e2 --prompts examples/prompts.json --out traces/olmoe.npz
 
 # 3) Train a traffic→token classifier from the trace
-moetl train --model olmoe --task output --traces traces/olmoe.npz --out models/olmoe_output.joblib
-moetl train --model olmoe --task output --traces traces/olmoe.npz --window causal \
+moescope train --model olmoe --task output --traces traces/olmoe.npz --out models/olmoe_output.joblib
+moescope train --model olmoe --task output --traces traces/olmoe.npz --window causal \
             --out models/olmoe_output_causal.joblib        # for live demo
 
 # 4) Confirm measured==computed on real multi-GPU NCCL
-torchrun --nproc_per_node=4 -m moetl.measure_ep --model olmoe --routing traces/olmoe.npz
+torchrun --nproc_per_node=4 -m moescope.measure_ep --model olmoe --routing traces/olmoe.npz
 
 # 5) Live reconstruction demo (left: model generating; right: recovery from traffic)
-moetl demo --model olmoe --output-clf models/olmoe_output_causal.joblib
-moetl demo --model olmoe --mock-model            # UI/pipeline preview without a model
+moescope demo --model olmoe --output-clf models/olmoe_output_causal.joblib
+moescope demo --model olmoe --mock-model            # UI/pipeline preview without a model
 ```
+
+## EP serving on multiple GPUs
+
+`moescope serve-ep` runs the model itself in expert-parallel form. One process owns one GPU. Experts
+are split in index order (`E/G` per GPU); rank 0 holds the request, the shared parts of the model
+(embeddings, attention, routers) and its own experts, and every other rank holds only its experts.
+In each MoE layer rank 0 dispatches tokens to the GPUs of the selected experts with a real
+`all_to_all`, those GPUs run the expert computation, and the results are combined on rank 0. The
+number of rows actually sent to each GPU is recorded per layer — that is the measured traffic.
+
+```bash
+# decode: generate token by token, record per-step traffic       (keys: tokens, routing, measured, ...)
+moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
+
+# prefill: feed each prompt at once, record per-prompt traffic   (keys: e1_routing, e1_lengths, e1_measured)
+moescope serve-ep --model olmoe --task e1 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_e1.npz --check
+
+# train the classifiers on the measured traffic
+moescope train --model olmoe --task output --traces traces/olmoe_ep.npz    --gpus 4 --source measured
+moescope train --model olmoe --task domain --traces traces/olmoe_ep_e1.npz --gpus 4 --source measured
+```
+
+`serve-ep` prints a report and exits non-zero if any layer's measured traffic differs from the
+count computed from the routing (`layer_calls_mismatch`). With `--check` the same inputs are first
+run on a single GPU with the unmodified model, and the report adds `token_agreement` (decode) or
+`max_logit_diff` (prefill). `--check` needs the whole model on GPU 0 once (about 14 GB for OLMoE).
+
+Running on a 4-GPU AWS instance (e.g. `g6.12xlarge`, 4× NVIDIA L4, with a PyTorch/CUDA image):
+
+```bash
+git clone https://github.com/leehyeoklee/moescope.git && cd moescope
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[model,dev]"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv     # expect 4 GPUs
+pytest -q                                                        # CPU tests, including a small EP-served model
+moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
+```
+
+Each process loads the checkpoint on CPU in turn before moving its share to its GPU, so the host
+needs roughly one model's worth of RAM free (about 14 GB for OLMoE in bfloat16).
 
 ## How it works
 
@@ -93,7 +133,7 @@ prompt ─▶ MoE model (EP across G GPUs)
 ## Supported models
 
 `olmoe` (OLMoE-1B-7B), `granite` (Granite-3.0-3B-A800M), `qwen` (Qwen1.5-MoE-A2.7B). Checkpoints
-and revisions are pinned in `moetl/config.py`; the serving/measuring model must match the one used
+and revisions are pinned in `moescope/config.py`; the serving/measuring model must match the one used
 to collect the training traces.
 
 ## Limitations
@@ -112,8 +152,8 @@ to collect the training traces.
 ## Project layout
 
 ```
-moetl/        config · placement · traffic · ep · collect · classifiers · measure_ep · demo · cli
-tests/        test_ep (gloo measured==computed) · test_placement · test_traffic
+moescope/        config · placement · traffic · ep · collect · serve_ep · classifiers · measure_ep · demo · cli
+tests/        test_ep (gloo measured==computed) · test_serve_ep (EP-served model == single process) · test_placement · test_traffic
 examples/     sample prompts
 ```
 
