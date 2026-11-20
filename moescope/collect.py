@@ -4,8 +4,8 @@ transformers의 output_router_logits를 쓴다(모델 공용). 층별 router_log
 (num_tokens, num_experts)의 top-k 인덱스 = 선택 Expert id.
 
 스키마
-  E2(출력): tokens(N,), routing(N, layers, k)uint8, prompt_ids(N,), step(N,), generated(str)
-  E1(입력): e1_routing(sumTok, layers, k), e1_lengths(P,), e1_ids(P,)
+  decode(출력): tokens(N,), routing(N, layers, k)uint8, prompt_ids(N,), step(N,), generated(str)
+  prefill(입력): prefill_routing(sumTok, layers, k), prefill_lengths(P,), prefill_ids(P,)
 
 routing_from_logits만 모델 없이 단위 테스트된다. 나머지는 GPU(실제 모델) 필요.
 """
@@ -43,7 +43,7 @@ def load_model(spec, dtype="bfloat16", device_map="auto"):
     return model, tok
 
 
-def collect_e2(model, tok, prompts, spec, max_new_tokens=64, greedy=True):
+def collect_decode(model, tok, prompts, spec, max_new_tokens=64, greedy=True):
     """출력 토큰 복원용: 생성하며 스텝별 라우팅 수집 → v7 스키마 dict."""
     import torch
     toks, routes, pids, steps, gen_texts = [], [], [], [], []
@@ -69,8 +69,8 @@ def collect_e2(model, tok, prompts, spec, max_new_tokens=64, greedy=True):
             "generated": np.array("\u0001".join(gen_texts))}
 
 
-def collect_e1(model, tok, prompts, spec, max_len=32):
-    """입력 분야용: 프롬프트 prefill 라우팅(토큰별) → e1 스키마 dict."""
+def collect_prefill(model, tok, prompts, spec, max_len=32):
+    """입력 분야용: 프롬프트 prefill 라우팅(토큰별) → prefill 스키마 dict."""
     import torch
     routings, lengths = [], []
     for prompt in prompts:
@@ -79,6 +79,6 @@ def collect_e1(model, tok, prompts, spec, max_len=32):
             out = model(**ids, output_router_logits=True, use_cache=False)
         r = routing_from_logits(out.router_logits, spec.top_k, spec.experts)
         routings.append(r); lengths.append(len(r))
-    return {"e1_routing": np.concatenate(routings).astype(np.uint8),
-            "e1_lengths": np.array(lengths, np.int32),
-            "e1_ids": np.arange(len(prompts), np.int32)}
+    return {"prefill_routing": np.concatenate(routings).astype(np.uint8),
+            "prefill_lengths": np.array(lengths, np.int32),
+            "prefill_ids": np.arange(len(prompts), np.int32)}

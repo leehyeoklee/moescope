@@ -49,14 +49,14 @@ pip install -e ".[model,dev]"      # torch, transformers, accelerate, scikit-lea
 
 ```bash
 # 1) Serve the model in EP form and record the traffic of the decode stage (token by token)
-moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
+moescope serve-ep --model olmoe --task decode --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_decode.npz --check
 
 # 2) Same for the prefill stage (each prompt fed at once)
-moescope serve-ep --model olmoe --task e1 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_e1.npz --check
+moescope serve-ep --model olmoe --task prefill --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_prefill.npz --check
 
 # 3) Train the classifiers on the measured traffic
-moescope train --model olmoe --task output --traces traces/olmoe_ep.npz    --gpus 4 --source measured
-moescope train --model olmoe --task domain --traces traces/olmoe_ep_e1.npz --gpus 4 --source measured
+moescope train --model olmoe --task output --traces traces/olmoe_ep_decode.npz    --gpus 4 --source measured
+moescope train --model olmoe --task domain --traces traces/olmoe_ep_prefill.npz --gpus 4 --source measured
 ```
 
 `serve-ep` prints a report and ends with `RESULT: PASS` when the measured traffic of every layer
@@ -78,14 +78,14 @@ computation (`experts_implementation="eager"`), the same arithmetic as the EP pa
 
 | task | key | shape | content |
 |---|---|---|---|
-| `e2` | `tokens` | (N,) | generated token ids |
+| `decode` | `tokens` | (N,) | generated token ids |
 | | `routing` | (N, layers, k) | top-k expert ids per step |
 | | `measured` | (N, layers, G) | rows sent to each GPU per step |
 | | `prefill_measured` | (P, layers, G) | rows sent to each GPU while reading each prompt |
 | | `prompt_ids`, `step`, `generated` | | prompt index, step index, decoded text |
-| `e1` | `e1_routing` | (tokens, layers, k) | top-k expert ids per input token |
-| | `e1_lengths` | (P,) | number of input tokens per prompt |
-| | `e1_measured` | (P, layers, G) | rows sent to each GPU per prompt |
+| `prefill` | `prefill_routing` | (tokens, layers, k) | top-k expert ids per input token |
+| | `prefill_lengths` | (P,) | number of input tokens per prompt |
+| | `prefill_measured` | (P, layers, G) | rows sent to each GPU per prompt |
 
 ## Supported models and GPU counts
 
@@ -110,7 +110,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[model,dev]"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv     # expect 4 GPUs
 pytest -q                                                        # CPU tests, including small EP-served models
-moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
+moescope serve-ep --model olmoe --task decode --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_decode.npz --check
 ```
 
 Each process loads the checkpoint on CPU in turn and then moves its share to its GPU, so the host
@@ -149,7 +149,7 @@ measured traffic ─▶ traffic.measured_features / measured_prompt_features ─
 
 ```bash
 moescope verify-ep --gpus 4                      # all_to_all row counts vs computed counts, random routing, CPU
-moescope collect --model olmoe --task e2 --prompts examples/prompts.json --out traces/olmoe.npz    # routing only, single device
+moescope collect --model olmoe --task decode --prompts examples/prompts.json --out traces/olmoe.npz    # routing only, single device
 moescope measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4                              # replay a routing trace through all_to_all
 moescope train --model olmoe --task output --traces traces/olmoe.npz --window causal --out models/olmoe_output_causal.joblib
 moescope demo --model olmoe --output-clf models/olmoe_output_causal.joblib                         # live generation next to the estimated tokens

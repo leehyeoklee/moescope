@@ -76,13 +76,17 @@ def train_output(trace_path, experts, gpus, window="none", seed=SEED, save=None,
 
 
 def train_domain(trace_path, experts, gpus, seed=SEED, save=None, source="computed"):
-    """입력 분야 분류기. 트레이스 키: 고정길이 routing(P,L,T,k)+labels, 또는 e1_routing+e1_lengths+labels."""
+    """입력 분야 분류기. 트레이스 키: 고정길이 routing(P,L,T,k)+labels, 또는 prefill_routing+prefill_lengths+labels."""
     d = np.load(trace_path)
     labels = np.asarray(d["labels"])
+
+    def key(name):                      # 예전 파일은 prefill_ 대신 e1_ 로 저장돼 있다
+        return f"prefill_{name}" if f"prefill_{name}" in d.files else f"e1_{name}"
+
     if source == "measured":
-        x = measured_prompt_features(d["e1_measured"], d["e1_lengths"])
-    elif "e1_routing" in d.files:
-        x = prompt_features(d["e1_routing"], d["e1_lengths"], experts, gpus)
+        x = measured_prompt_features(d[key("measured")], d[key("lengths")])
+    elif key("routing") in d.files:
+        x = prompt_features(d[key("routing")], d[key("lengths")], experts, gpus)
     else:  # 고정길이 포맷 (P, layers, tokens, k)
         from .placement import dest_counts_feat
         r = d["routing"]

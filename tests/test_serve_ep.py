@@ -26,7 +26,7 @@ def _launch(task, gpus, port, dtype="float32", family="olmoe"):
 
 @pytest.mark.parametrize("gpus,port", [(2, 29711), (4, 29712)])
 def test_decode_matches_single_process(gpus, port):
-    data, report = _launch("e2", gpus, port)
+    data, report = _launch("decode", gpus, port)
     assert report["layer_calls_mismatch"] == 0, "측정 통신량 != 라우팅 계산값"
     assert report["token_agreement"] == 1.0, "EP로 생성한 토큰이 원래 모델과 다르다"
     assert report["forced_token_agreement"] == 1.0 and report["forced_max_logit_diff"] < 1e-5
@@ -41,18 +41,18 @@ def test_decode_matches_single_process(gpus, port):
 
 @pytest.mark.parametrize("gpus,port", [(2, 29721), (4, 29722)])
 def test_prefill_matches_single_process(gpus, port):
-    data, report = _launch("e1", gpus, port)
+    data, report = _launch("prefill", gpus, port)
     assert report["layer_calls_mismatch"] == 0
     assert report["max_logit_diff"] < 1e-5, "EP로 계산한 logits가 원래 모델과 다르다"
-    assert data["e1_measured"].shape == (len(INPUTS), LAYERS, gpus)
+    assert data["prefill_measured"].shape == (len(INPUTS), LAYERS, gpus)
     lengths = np.array([len(x) for x in INPUTS])
-    assert np.array_equal(data["e1_lengths"], lengths)
-    assert (data["e1_measured"].sum(-1) == lengths[:, None] * TOP_K).all()
+    assert np.array_equal(data["prefill_lengths"], lengths)
+    assert (data["prefill_measured"].sum(-1) == lengths[:, None] * TOP_K).all()
 
 
 def test_half_precision_transport():
     """bfloat16 hidden state도 all_to_all로 오가며 결과가 유지된다."""
-    data, report = _launch("e2", 2, 29731, dtype="bfloat16")
+    data, report = _launch("decode", 2, 29731, dtype="bfloat16")
     assert report["layer_calls_mismatch"] == 0
     assert report["token_agreement"] == 1.0
 
@@ -61,7 +61,7 @@ def test_half_precision_transport():
                                               ("qwen", 2, 29743), ("qwen", 4, 29744)])
 def test_other_model_families(family, gpus, port):
     """Granite, Qwen1.5-MoE와 같은 구조의 모델도 EP 결과가 원래 모델과 같다."""
-    data, report = _launch("e2", gpus, port, family=family)
+    data, report = _launch("decode", gpus, port, family=family)
     assert report["layer_calls_mismatch"] == 0
     assert report["token_agreement"] == 1.0
     assert report["forced_token_agreement"] == 1.0 and report["forced_max_logit_diff"] < 1e-5
@@ -70,10 +70,10 @@ def test_other_model_families(family, gpus, port):
 
 def test_single_gpu_has_no_cross_traffic():
     """GPU가 하나면 모든 Expert가 같은 GPU에 있어 다른 GPU로 가는 전송이 없다."""
-    data, report = _launch("e2", 1, 29751)
+    data, report = _launch("decode", 1, 29751)
     assert report["token_agreement"] == 1.0 and data["measured"].shape[-1] == 1
 
 
 def test_gpu_count_must_divide_experts():
     with pytest.raises(ValueError):
-        _launch("e2", 3, 29761)
+        _launch("decode", 3, 29761)

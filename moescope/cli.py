@@ -66,8 +66,8 @@ def cmd_collect(a):
         prompts = prompts.get("prompts", list(prompts.values()))
     print(f"[collect] {a.model} task={a.task} prompts={len(prompts)}")
     model, tok = collect.load_model(spec)
-    data = (collect.collect_e2(model, tok, prompts, spec, max_new_tokens=a.max_new_tokens)
-            if a.task == "e2" else collect.collect_e1(model, tok, prompts, spec))
+    data = (collect.collect_decode(model, tok, prompts, spec, max_new_tokens=a.max_new_tokens)
+            if a.task == "decode" else collect.collect_prefill(model, tok, prompts, spec))
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(a.out, **data)
     print(f"  saved {a.out}")
@@ -123,7 +123,7 @@ def main():
     s.set_defaults(func=cmd_verify_ep)
 
     s = _add(sub, "collect", "실제 모델 라우팅 추출 [GPU]")
-    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["e1", "e2"], default="e2")
+    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["prefill", "decode"], default="decode")
     s.add_argument("--prompts", required=True); s.add_argument("--out", required=True)
     s.add_argument("--max-new-tokens", type=int, default=64); s.set_defaults(func=cmd_collect)
 
@@ -136,7 +136,7 @@ def main():
     s.set_defaults(func=cmd_train)
 
     s = _add(sub, "serve-ep", "모델을 EP로 서빙하며 통신량 측정 [멀티 GPU]")
-    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["e1", "e2"], default="e2")
+    s.add_argument("--model", default="olmoe"); s.add_argument("--task", choices=["prefill", "decode"], default="decode")
     s.add_argument("--prompts", required=True); s.add_argument("--out", required=True)
     s.add_argument("--gpus", type=int, default=4); s.add_argument("--max-new-tokens", type=int, default=64)
     s.add_argument("--check", action="store_true", help="한 GPU에서 실행한 결과와 비교")

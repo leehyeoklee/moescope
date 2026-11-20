@@ -22,8 +22,8 @@ def test_volume_features_values_match_manual():
 
 def test_prompt_features_normalized_by_length():
     # 2 prompts, lengths 2 and 1
-    e1 = np.array([[[0, 16, 17, 48]], [[0, 16, 17, 48]], [[0, 16, 17, 48]]])  # (3 tok,1 layer,k4)
-    x = prompt_features(e1, [2, 1], 64, 4)
+    routing = np.array([[[0, 16, 17, 48]], [[0, 16, 17, 48]], [[0, 16, 17, 48]]])  # (3 tok,1 layer,k4)
+    x = prompt_features(routing, [2, 1], 64, 4)
     assert x.shape == (2, 3)  # 1 layer * (4-1)
     # prompt0: 두 토큰 합 [2,0,1]*2 /2 = [2,0,1]
     assert np.allclose(x[0], [2, 0, 1])

@@ -12,8 +12,8 @@ gate_up_proj / down_proj, forward(hidden, top_k_index, top_k_weights)) 하나만
 그 밖의 계산은 원래 모델 코드를 그대로 쓴다.
 
 실행
-  moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz
-  moescope serve-ep --model olmoe --task e1 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_e1.npz
+  moescope serve-ep --model olmoe --task decode --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_decode.npz
+  moescope serve-ep --model olmoe --task prefill --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_prefill.npz
   --check 를 주면 같은 입력을 한 GPU에서 실행한 결과와 비교한다(rank 0에 모델 전체가 올라갈 메모리 필요).
 """
 import os
@@ -172,7 +172,7 @@ def _forward(model, ids, past, rec):
 
 
 @torch.no_grad()
-def run_e2(model, rec, inputs, max_new_tokens, eos=None):
+def run_decode(model, rec, inputs, max_new_tokens, eos=None):
     """응답 생성(decode): 토큰을 하나씩 만들며 단계별 측정 통신량·라우팅을 모은다.
 
     프롬프트의 마지막 토큰은 따로 한 번에 넣는다. 그래야 첫 생성 단계의 통신량도 토큰 하나 몫으로
@@ -204,7 +204,7 @@ def run_e2(model, rec, inputs, max_new_tokens, eos=None):
 
 
 @torch.no_grad()
-def run_e1(model, rec, inputs):
+def run_prefill(model, rec, inputs):
     """입력 처리(prefill): 프롬프트를 한 번에 넣고 프롬프트 단위 측정 통신량·라우팅을 모은다."""
     device = next(model.parameters()).device
     routes, lengths, vols = [], [], []
@@ -212,8 +212,8 @@ def run_e1(model, rec, inputs):
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
         _, s, r = _forward(model, ids, None, rec)
         routes.append(r); lengths.append(len(r)); vols.append(s)
-    return {"e1_routing": np.concatenate(routes).astype(np.int32), "e1_lengths": np.array(lengths, np.int32),
-            "e1_measured": np.stack(vols), "e1_ids": np.arange(len(inputs), dtype=np.int32)}
+    return {"prefill_routing": np.concatenate(routes).astype(np.int32), "prefill_lengths": np.array(lengths, np.int32),
+            "prefill_measured": np.stack(vols), "prefill_ids": np.arange(len(inputs), dtype=np.int32)}
 
 
 @torch.no_grad()
@@ -247,7 +247,7 @@ def reference(model, inputs, task, max_new_tokens, eos=None):
     res = []
     for ids in inputs:
         ids = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
-        if task == "e1":
+        if task == "prefill":
             res.append(model(input_ids=ids, use_cache=False).logits[0, -1].float().cpu()); continue
         past, cur, gen, lg = None, ids, [], []
         if ids.shape[1] > 1:
@@ -309,7 +309,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
             if rank == 0:
                 inputs = job.get("inputs")
                 if inputs is None:
-                    kw = {"truncation": True, "max_length": job.get("max_len", 32)} if job["task"] == "e1" else {}
+                    kw = {"truncation": True, "max_length": job.get("max_len", 32)} if job["task"] == "prefill" else {}
                     inputs = [tok(p, **kw)["input_ids"] for p in job["prompts"]]
                 if job.get("check"):
                     ref = _reference_run(model, loader, backend, device, inputs, job,
@@ -333,11 +333,11 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
     rec = Recorder(layers, experts, world)
     attach(model, experts, world, rank, device, rec)
     eos = getattr(tok, "eos_token_id", None)
-    data = (run_e1(model, rec, inputs) if job["task"] == "e1"
-            else run_e2(model, rec, inputs, job.get("max_new_tokens", 64), eos))
+    data = (run_prefill(model, rec, inputs) if job["task"] == "prefill"
+            else run_decode(model, rec, inputs, job.get("max_new_tokens", 64), eos))
     report = {"gpus": world, "backend": backend, "layer_calls_mismatch": rec.mismatch}
     if ref is not None:
-        if job["task"] == "e1":                   # 마지막 위치의 logits를 다시 계산해 비교
+        if job["task"] == "prefill":                   # 마지막 위치의 logits를 다시 계산해 비교
             diffs = []
             for ids, r in zip(inputs, ref):
                 ids_t = torch.as_tensor(ids, dtype=torch.long, device=device)[None]
@@ -354,7 +354,7 @@ def run_rank(rank, world, backend, loader, spec, job, ret, port=29541):
             report.update(run_forced(model, rec, inputs, ref))
     stop_workers(device)
     dist.barrier(); dist.destroy_process_group()
-    if tok is not None and job["task"] == "e2":
+    if tok is not None and job["task"] == "decode":
         texts, start = [], 0
         for p in range(len(inputs)):
             n = int((data["prompt_ids"] == p).sum())
