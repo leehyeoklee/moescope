@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "moescope"
 version = "0.1.0"
-description = "Study information leakage via GPU-to-GPU communication volume in Mixture-of-Experts expert-parallel inference."
+description = "Expert-parallel serving of Mixture-of-Experts models with per-layer GPU-to-GPU traffic measurement."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-keywords = ["mixture-of-experts", "expert-parallelism", "side-channel", "privacy", "all-to-all", "llm"]
+keywords = ["mixture-of-experts", "expert-parallelism", "serving", "traffic", "all-to-all", "llm"]
 dependencies = [
     "numpy>=1.24",
     "scikit-learn>=1.3",

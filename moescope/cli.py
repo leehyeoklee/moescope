@@ -1,4 +1,4 @@
-"""moescope — MoE 통신량 누출 툴 CLI.
+"""moescope — MoE 모델의 EP 서빙과 GPU 간 통신량 측정 CLI.
 
   moescope verify-ep   측정 통신량 = 라우팅 계산 검증 (gloo CPU / NCCL GPU)
   moescope collect     실제 모델에서 라우팅 추출 → 트레이스(.npz)   [GPU]

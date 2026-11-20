@@ -1,36 +1,39 @@
 # moescope
 
-**Does the volume of GPU-to-GPU communication leak what a Mixture-of-Experts model is doing?**
+Serve open Mixture-of-Experts (MoE) language models in expert-parallel (EP) form across several
+GPUs, measure the GPU-to-GPU traffic of every MoE layer while the model runs, and estimate the
+input topic and the generated tokens from that traffic alone.
 
-In expert-parallel (EP) MoE inference, each layer routes every token to the GPUs that hold its
-selected experts via an `all_to_all`. The *number of tokens* sent to each GPU depends on the
-routing — which depends on the input. This project is a small toolkit to study that channel:
-measure the real inter-GPU traffic, and show that **the traffic volume alone is enough to
-recover the input topic and the generated tokens.**
+In EP serving the experts of each MoE layer are spread over the GPUs. A router picks the top-k
+experts for every token, the token is sent to the GPUs that hold those experts with an
+`all_to_all`, the experts are computed there, and the results are sent back and combined. How many
+rows go to each GPU depends on which experts were picked, and that depends on the input. moescope
+runs this for real, records the per-layer, per-GPU row counts, and trains classifiers on them.
 
-The central, testable claim:
+## What it does
 
-> The number of rows an EP `all_to_all` actually sends to each destination GPU **equals** the
-> count computed directly from the routing table. So an observer who sees only per-destination
-> traffic volume sees the routing — and routing leaks content.
+- **EP serving.** One process per GPU. Experts are split in index order (`E/G` per GPU). The
+  model produces the same output as when it runs on a single GPU.
+- **Traffic measurement.** For every MoE layer, the number of rows actually sent to each GPU is
+  recorded: per prompt in the prefill stage, per generated token in the decode stage.
+- **Feature extraction and classifiers.** The measured traffic is turned into classifier inputs
+  (prefill traffic divided by the number of input tokens; decode traffic per generated token). An
+  input-topic classifier and an output-token classifier (standardization followed by logistic
+  regression) are trained and evaluated on them.
 
-This is verified in code on both CPU (`gloo`) and real GPUs (`NCCL`).
+## Verified results
 
-## Key result
+EP-served output compared with the unmodified model, and measured traffic compared with the count
+computed from the routing:
 
-`measured == computed` — the real `all_to_all` send counts equal the routing-derived counts,
-with **zero** mismatch:
+| model | hardware | processes | generated tokens equal | max logit difference | layers with traffic mismatch |
+|---|---|---|---|---|---|
+| OLMoE-1B-7B Instruct | 2× Tesla T4 (NCCL) | 2 (32 experts each) | 160 / 160 | 0 | 0 |
+| Granite-3.0-3B-A800M | 2× Tesla T4 (NCCL) | 2 (20 experts each) | 160 / 160 | 0 | 0 |
 
-| backend | hardware | model(s) | steps | mismatched layers |
-|---|---|---|---|---|
-| gloo | CPU | olmoe, granite, qwen (G=4, 8) | — | **0** |
-| NCCL | 2× Tesla T4 | olmoe, real routing | 240 | **0 / 16** |
-
-On the T4 run, routing was also fully deterministic across repeats (`repeat_same_routing = 1.0`).
-
-Because the equality is exact integer counting over the *same* linear expert→GPU placement, it
-holds for any EP deployment using that placement — including larger GPU counts — so results
-obtained by computing traffic from routing transfer to a real multi-GPU deployment.
+Both runs used 5 prompts with 32 generated tokens each, plus a prefill run of the same prompts
+(max logit difference 0). The CPU test suite repeats the same comparison on small randomly
+initialized models with the OLMoE, Granite and Qwen1.5-MoE layouts, using 1, 2 and 4 processes.
 
 ## Install
 
@@ -39,136 +42,134 @@ git clone https://github.com/leehyeoklee/moescope.git
 cd moescope
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
-pip install -e .                   # core: numpy, scikit-learn, torch (CPU is enough for verify-ep / train / tests)
-pip install -e ".[model]"          # + transformers etc. for `collect` / `demo` (GPU recommended)
+pip install -e ".[model,dev]"      # torch, transformers, accelerate, scikit-learn, pytest
 ```
-
-On Windows, `torchrun` has a libuv issue, so use the equivalent self-launching command instead:
-`moescope measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4` (Linux can use either).
 
 ## Quickstart
 
 ```bash
-# 1) Verify the core claim locally (no GPU, no model): real all_to_all vs computed
-moescope verify-ep --gpus 4
-
-# 2) Collect routing from a real model (GPU)
-moescope collect --model olmoe --task e2 --prompts examples/prompts.json --out traces/olmoe.npz
-
-# 3) Train a traffic→token classifier from the trace
-moescope train --model olmoe --task output --traces traces/olmoe.npz --out models/olmoe_output.joblib
-moescope train --model olmoe --task output --traces traces/olmoe.npz --window causal \
-            --out models/olmoe_output_causal.joblib        # for live demo
-
-# 4) Confirm measured==computed on real multi-GPU NCCL
-torchrun --nproc_per_node=4 -m moescope.measure_ep --model olmoe --routing traces/olmoe.npz
-
-# 5) Live reconstruction demo (left: model generating; right: recovery from traffic)
-moescope demo --model olmoe --output-clf models/olmoe_output_causal.joblib
-moescope demo --model olmoe --mock-model            # UI/pipeline preview without a model
-```
-
-## EP serving on multiple GPUs
-
-`moescope serve-ep` runs the model itself in expert-parallel form. One process owns one GPU. Experts
-are split in index order (`E/G` per GPU); rank 0 holds the request, the shared parts of the model
-(embeddings, attention, routers) and its own experts, and every other rank holds only its experts.
-In each MoE layer rank 0 dispatches tokens to the GPUs of the selected experts with a real
-`all_to_all`, those GPUs run the expert computation, and the results are combined on rank 0. The
-number of rows actually sent to each GPU is recorded per layer — that is the measured traffic.
-
-```bash
-# decode: generate token by token, record per-step traffic       (keys: tokens, routing, measured, ...)
+# 1) Serve the model in EP form and record the traffic of the decode stage (token by token)
 moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
 
-# prefill: feed each prompt at once, record per-prompt traffic   (keys: e1_routing, e1_lengths, e1_measured)
+# 2) Same for the prefill stage (each prompt fed at once)
 moescope serve-ep --model olmoe --task e1 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep_e1.npz --check
 
-# train the classifiers on the measured traffic
+# 3) Train the classifiers on the measured traffic
 moescope train --model olmoe --task output --traces traces/olmoe_ep.npz    --gpus 4 --source measured
 moescope train --model olmoe --task domain --traces traces/olmoe_ep_e1.npz --gpus 4 --source measured
 ```
 
-`serve-ep` prints a report and exits non-zero if any layer's measured traffic differs from the
-count computed from the routing (`layer_calls_mismatch`). With `--check` the same inputs are first
-run on a single GPU with the unmodified model, and the report adds `token_agreement` (decode) or
-`max_logit_diff` (prefill). `--check` needs the whole model on GPU 0 once (about 14 GB for OLMoE).
+`serve-ep` prints a report and ends with `RESULT: PASS` when the measured traffic of every layer
+equals the count computed from the routing (`layer_calls_mismatch: 0`).
 
-Running on a 4-GPU AWS instance (e.g. `g6.12xlarge`, 4× NVIDIA L4, with a PyTorch/CUDA image):
+With `--check`, the same inputs are first run with the unmodified model and the report adds:
+
+| field | stage | meaning |
+|---|---|---|
+| `token_agreement` | decode | share of freely generated tokens equal to the unmodified model |
+| `forced_token_agreement` | decode | share of steps with the same next token when both are fed the same tokens |
+| `forced_max_logit_diff` | decode | largest logit difference over those steps |
+| `max_logit_diff` | prefill | largest logit difference at the last position |
+
+For this comparison the unmodified model is spread over the available GPUs and uses per-expert
+computation (`experts_implementation="eager"`), the same arithmetic as the EP path.
+
+### Output files
+
+| task | key | shape | content |
+|---|---|---|---|
+| `e2` | `tokens` | (N,) | generated token ids |
+| | `routing` | (N, layers, k) | top-k expert ids per step |
+| | `measured` | (N, layers, G) | rows sent to each GPU per step |
+| | `prefill_measured` | (P, layers, G) | rows sent to each GPU while reading each prompt |
+| | `prompt_ids`, `step`, `generated` | | prompt index, step index, decoded text |
+| `e1` | `e1_routing` | (tokens, layers, k) | top-k expert ids per input token |
+| | `e1_lengths` | (P,) | number of input tokens per prompt |
+| | `e1_measured` | (P, layers, G) | rows sent to each GPU per prompt |
+
+## Supported models and GPU counts
+
+Checkpoints and revisions are pinned in `moescope/config.py`.
+
+| `--model` | checkpoint | MoE layers | experts | top-k | usable `--gpus` |
+|---|---|---|---|---|---|
+| `olmoe` | allenai/OLMoE-1B-7B-0125-Instruct | 16 | 64 | 8 | 1, 2, 4, 8, 16, 32, 64 |
+| `granite` | ibm-granite/granite-3.0-3b-a800m-instruct | 32 | 40 | 8 | 1, 2, 4, 5, 8, 10, 20, 40 |
+| `qwen` | Qwen/Qwen1.5-MoE-A2.7B-Chat | 24 | 60 | 4 | 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60 |
+
+`--gpus` must divide the number of experts and must not exceed the GPUs of the machine;
+`serve-ep` stops before loading the model otherwise.
+
+## Running on a multi-GPU instance
+
+Example for a 4-GPU AWS instance (`g6.12xlarge`, 4× NVIDIA L4) with a PyTorch/CUDA image:
 
 ```bash
 git clone https://github.com/leehyeoklee/moescope.git && cd moescope
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[model,dev]"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv     # expect 4 GPUs
-pytest -q                                                        # CPU tests, including a small EP-served model
+pytest -q                                                        # CPU tests, including small EP-served models
 moescope serve-ep --model olmoe --task e2 --prompts examples/prompts.json --gpus 4 --out traces/olmoe_ep.npz --check
 ```
 
-Each process loads the checkpoint on CPU in turn before moving its share to its GPU, so the host
-needs roughly one model's worth of RAM free (about 14 GB for OLMoE in bfloat16).
+Each process loads the checkpoint on CPU in turn and then moves its share to its GPU, so the host
+needs about one model's worth of free RAM (about 14 GB for OLMoE in bfloat16).
 
 ## How it works
 
 ```
-prompt ─▶ MoE model (EP across G GPUs)
-             │  each layer: route tokens to experts' GPUs via all_to_all
-             ▼
-     ep.ep_layer  ── measures rows sent per destination GPU  ◀── the only thing an observer sees
+prompt ─▶ rank 0 (GPU 0): embeddings, attention, routers, experts 0 … E/G-1
              │
+             │  every MoE layer:
+             │    router picks top-k experts per token
+             │    all_to_all dispatch ─▶ rank r (GPU r): experts r·E/G … (r+1)·E/G-1 compute
+             │    all_to_all combine  ◀─ results, weighted sum on rank 0
+             │    rows sent per destination GPU are recorded            ─▶ measured traffic
              ▼
-   traffic.volume_features  (per-layer, per-destination counts)
-             │
-             ▼
-   classifiers  ── input topic / output token recovery
+        next layer … logits
+
+measured traffic ─▶ traffic.measured_features / measured_prompt_features ─▶ classifiers
 ```
 
-- `ep.ep_layer` performs a dropless, per-`(token, expert)` `all_to_all` and returns the measured
-  per-destination send counts. The same function runs under `gloo` (CPU) and `NCCL` (GPU).
-- `placement.dest_counts_full` computes the expected counts from the routing table.
-- `collect` extracts routing from a real model via `output_router_logits` (top-k indices).
-- `classifiers` trains logistic-regression recovers of input topic and output token from the
-  traffic features (dictionary = tokens seen ≥ 5× in training).
+- `serve_ep` loads the model in every process, keeps only that process's experts on its GPU, and
+  replaces the forward of the model's experts module with the EP path. Routers and all other
+  computation are the model's own code.
+- `ep.ep_layer` performs the `all_to_all` dispatch, the local expert computation and the combine
+  for one MoE layer and returns the rows sent to each GPU. The same code runs under `NCCL` (GPU)
+  and `gloo` (CPU). Half-precision hidden states are carried as bytes, and expert contributions
+  are added in ascending expert order so the result equals the unmodified model.
+- `placement.dest_counts_full` computes the same counts from the routing; `serve-ep` compares the
+  two for every layer call.
+- `traffic` turns traffic into classifier inputs; `classifiers` trains and evaluates the
+  input-topic and output-token classifiers (token dictionary = tokens seen at least 5 times in
+  training).
 
-## Supported models
+## Other commands
 
-`olmoe` (OLMoE-1B-7B), `granite` (Granite-3.0-3B-A800M), `qwen` (Qwen1.5-MoE-A2.7B). Checkpoints
-and revisions are pinned in `moescope/config.py`; the serving/measuring model must match the one used
-to collect the training traces.
-
-## Limitations
-
-- **Interconnect.** Routing-dependent `all_to_all` of this kind needs an EP backend that sends
-  only to the needed GPUs. Production engines use it on NVLink/RDMA; on PCIe-only setups their
-  default backends send fixed-size traffic, so nothing leaks there. This toolkit's custom
-  `all_to_all` works on any interconnect but is not a production serving engine.
-- **Single request.** All recovery assumes one request at a time; mixing concurrent requests sums
-  the traffic and degrades recovery quickly.
-- **Precision.** Low-precision (bf16) routing can flip near-tied top-k choices across runs on some
-  hardware; use an fp32 router / report the repeat-match rate. (It was 1.0 on T4.)
-- **Upper bound.** Traffic computed from routing is a noise-free upper bound on what a real
-  side-channel observer could measure.
+```bash
+moescope verify-ep --gpus 4                      # all_to_all row counts vs computed counts, random routing, CPU
+moescope collect --model olmoe --task e2 --prompts examples/prompts.json --out traces/olmoe.npz    # routing only, single device
+moescope measure-ep --model olmoe --routing traces/olmoe.npz --gpus 4                              # replay a routing trace through all_to_all
+moescope train --model olmoe --task output --traces traces/olmoe.npz --window causal --out models/olmoe_output_causal.joblib
+moescope demo --model olmoe --output-clf models/olmoe_output_causal.joblib                         # live generation next to the estimated tokens
+```
 
 ## Project layout
 
 ```
-moescope/        config · placement · traffic · ep · collect · serve_ep · classifiers · measure_ep · demo · cli
-tests/        test_ep (gloo measured==computed) · test_serve_ep (EP-served model == single process) · test_placement · test_traffic
+moescope/     config · placement · ep · serve_ep · collect · traffic · classifiers · measure_ep · demo · cli
+tests/        test_serve_ep (EP-served model == single process) · test_ep · test_placement · test_traffic
 examples/     sample prompts
 ```
 
 ## Tests
 
 ```bash
-pip install pytest && pytest -q
+pytest -q
 ```
 
-CI runs the CPU tests (including the `gloo` measured==computed check) on every push.
-
-## Disclaimer
-
-This is a research tool for studying and defending against a privacy side-channel in MoE serving.
-Use it on systems you own or are authorized to analyze.
+22 tests, all on CPU. The 11 EP-serving tests need `transformers` and are skipped without it.
 
 ## License
 
